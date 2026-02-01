@@ -5,7 +5,7 @@
 <a id="zh"></a>
 ## 中文
 
-基于 tmux 输出的稳定性监测插件：当某个 pane 的输出在 N 秒内保持不变时，触发告警并唤醒 Agent，总结并通知你。
+基于 tmux 输出的稳定性监测插件：当某个 pane 的输出在连续 N 次捕获中保持不变时，触发告警并唤醒 Agent，总结并通知你。
 
 ### 安装
 
@@ -47,8 +47,8 @@ openclaw plugins install ./tmux-watch.tgz
         "enabled": true,
         "config": {
           "socket": "/private/tmp/tmux-501/default",
-          "pollIntervalMs": 1000,
-          "stableSeconds": 5,
+          "captureIntervalSeconds": 10,
+          "stableCount": 6,
           "captureLines": 200,
           "stripAnsi": true,
           "maxOutputChars": 4000,
@@ -64,6 +64,21 @@ openclaw plugins install ./tmux-watch.tgz
   }
 }
 ```
+
+#### 配置项说明
+
+- `enabled`：是否启用插件（默认 `true`）。
+- `socket`：tmux socket 路径（必填）。
+- `captureIntervalSeconds`：每次捕获间隔（秒），默认 `10`。
+- `stableCount`：连续多少次捕获内容一致才触发告警，默认 `6`。总时长 = `captureIntervalSeconds × stableCount`（例如 `3 × 5 = 15s`）。
+- `pollIntervalMs`：**兼容字段**，捕获间隔（毫秒）。仅在需要与旧配置兼容时使用。
+- `stableSeconds`：**兼容字段**，稳定时长（秒）。会按当前捕获间隔换算成次数。
+- `captureLines`：从 pane 末尾向上截取的行数（默认 `200`）。
+- `stripAnsi`：是否剥离 ANSI 转义码（默认 `true`）。
+- `maxOutputChars`：通知中最多包含的输出字符数（默认 `4000`，超出将从末尾截断）。
+- `sessionKey`：覆盖默认 Agent 会话（通常不需要改）。
+- `notify.mode`：通知方式（`last` / `targets` / `targets+last`）。
+- `notify.targets`：通知目标数组（支持多个 channel，按数组顺序发送）。
 
 ### 快速配置（onboarding）
 
@@ -103,7 +118,8 @@ echo $TMUX
   "target": "session:0.0",
   "label": "codex-tui",
   "note": "本会话是AI编程TUI助手，卡住时总结最后输出并通知我",
-  "stableSeconds": 5
+  "captureIntervalSeconds": 3,
+  "stableCount": 5
 }
 ```
 
@@ -115,7 +131,7 @@ echo $TMUX
 <a id="en"></a>
 ## English
 
-tmux-watch monitors a tmux pane and triggers an alert when the output stays unchanged for N seconds.
+tmux-watch monitors a tmux pane and triggers an alert when the output stays unchanged for N consecutive captures.
 The agent is woken up to summarize the last output and notify you.
 
 ### Install
@@ -158,8 +174,8 @@ Edit `~/.openclaw/openclaw.json`:
         "enabled": true,
         "config": {
           "socket": "/private/tmp/tmux-501/default",
-          "pollIntervalMs": 1000,
-          "stableSeconds": 5,
+          "captureIntervalSeconds": 10,
+          "stableCount": 6,
           "captureLines": 200,
           "stripAnsi": true,
           "maxOutputChars": 4000,
@@ -175,6 +191,21 @@ Edit `~/.openclaw/openclaw.json`:
   }
 }
 ```
+
+#### Configuration reference
+
+- `enabled`: Enable/disable the plugin (default `true`).
+- `socket`: tmux socket path (required).
+- `captureIntervalSeconds`: Capture interval in seconds (default `10`).
+- `stableCount`: Number of consecutive identical captures before alert (default `6`). Total duration = `captureIntervalSeconds × stableCount` (for example `3 × 5 = 15s`).
+- `pollIntervalMs`: **Legacy** capture interval in milliseconds. Use only for backward compatibility.
+- `stableSeconds`: **Legacy** stable duration in seconds. Converted into counts using the current interval.
+- `captureLines`: Lines captured from the bottom of the pane (default `200`).
+- `stripAnsi`: Strip ANSI escape codes (default `true`).
+- `maxOutputChars`: Max output chars in the notification (default `4000`, tail-truncated).
+- `sessionKey`: Override the default agent session (rare).
+- `notify.mode`: Notification mode (`last` / `targets` / `targets+last`).
+- `notify.targets`: Notification targets (multiple channels supported, sent in order).
 
 #### Find the socket
 
@@ -214,7 +245,8 @@ openclaw tmux-watch setup --socket "/private/tmp/tmux-501/default"
   "target": "session:0.0",
   "label": "codex-tui",
   "note": "This is an AI coding TUI; summarize the last output and notify me if it stalls.",
-  "stableSeconds": 5
+  "captureIntervalSeconds": 3,
+  "stableCount": 5
 }
 ```
 

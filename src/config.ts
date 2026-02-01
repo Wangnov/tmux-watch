@@ -1,5 +1,3 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
-
 export type NotifyMode = "last" | "targets" | "targets+last";
 
 export type NotifyTarget = {
@@ -12,8 +10,10 @@ export type NotifyTarget = {
 
 export type TmuxWatchConfig = {
   enabled: boolean;
-  pollIntervalMs: number;
-  stableSeconds: number;
+  captureIntervalSeconds?: number;
+  pollIntervalMs?: number;
+  stableCount?: number;
+  stableSeconds?: number;
   captureLines: number;
   stripAnsi: boolean;
   maxOutputChars: number;
@@ -25,10 +25,11 @@ export type TmuxWatchConfig = {
   };
 };
 
-const DEFAULTS: TmuxWatchConfig = {
+export const DEFAULT_CAPTURE_INTERVAL_SECONDS = 10;
+export const DEFAULT_STABLE_COUNT = 6;
+
+const DEFAULTS: Omit<TmuxWatchConfig, "captureIntervalSeconds" | "pollIntervalMs" | "stableCount" | "stableSeconds"> = {
   enabled: true,
-  pollIntervalMs: 1000,
-  stableSeconds: 5,
   captureLines: 200,
   stripAnsi: true,
   maxOutputChars: 4000,
@@ -49,6 +50,13 @@ function readNumber(raw: unknown, fallback: number): number {
     return raw;
   }
   return fallback;
+}
+
+function readOptionalNumber(raw: unknown): number | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return raw;
+  }
+  return undefined;
 }
 
 function readBoolean(raw: unknown, fallback: boolean): boolean {
@@ -95,22 +103,19 @@ function normalizeTargets(raw: unknown): NotifyTarget[] {
   return targets;
 }
 
-export function resolveTmuxWatchConfig(
-  raw: unknown,
-  _cfg?: OpenClawConfig,
-): TmuxWatchConfig {
+export function resolveTmuxWatchConfig(raw: unknown): TmuxWatchConfig {
   const value = isRecord(raw) ? raw : {};
   const notifyRaw = isRecord(value.notify) ? value.notify : {};
 
-  const pollIntervalMs = Math.max(200, readNumber(value.pollIntervalMs, DEFAULTS.pollIntervalMs));
-  const stableSeconds = Math.max(1, readNumber(value.stableSeconds, DEFAULTS.stableSeconds));
   const captureLines = Math.max(10, readNumber(value.captureLines, DEFAULTS.captureLines));
   const maxOutputChars = Math.max(200, readNumber(value.maxOutputChars, DEFAULTS.maxOutputChars));
 
   return {
     enabled: readBoolean(value.enabled, DEFAULTS.enabled),
-    pollIntervalMs,
-    stableSeconds,
+    captureIntervalSeconds: readOptionalNumber(value.captureIntervalSeconds),
+    pollIntervalMs: readOptionalNumber(value.pollIntervalMs),
+    stableCount: readOptionalNumber(value.stableCount),
+    stableSeconds: readOptionalNumber(value.stableSeconds),
     captureLines,
     stripAnsi: readBoolean(value.stripAnsi, DEFAULTS.stripAnsi),
     maxOutputChars,

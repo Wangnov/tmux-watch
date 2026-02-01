@@ -8,8 +8,10 @@
     "additionalProperties": false,
     "properties": {
       "enabled": { "type": "boolean", "default": true },
-      "pollIntervalMs": { "type": "number", "default": 1000 },
-      "stableSeconds": { "type": "number", "default": 5 },
+      "captureIntervalSeconds": { "type": "number", "default": 10 },
+      "stableCount": { "type": "number", "default": 6 },
+      "pollIntervalMs": { "type": "number", "default": 10000 },
+      "stableSeconds": { "type": "number", "default": 60 },
       "captureLines": { "type": "number", "default": 200 },
       "stripAnsi": { "type": "boolean", "default": true },
       "maxOutputChars": { "type": "number", "default": 4000 },

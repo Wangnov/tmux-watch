@@ -1,3 +1,4 @@
+import type { Command } from "commander";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createTmuxWatchManager } from "./src/manager.js";
 import { createTmuxWatchService } from "./src/service.js";
@@ -13,8 +14,12 @@ const plugin = {
     api.registerTool(createTmuxWatchTool(manager));
     api.registerService(createTmuxWatchService(manager));
     api.registerCli(
-      ({ program }) => {
-        registerTmuxWatchCli({ program, api, logger: api.logger });
+      (ctx: { program: unknown }) => {
+        registerTmuxWatchCli({
+          program: ctx.program as Command,
+          api,
+          logger: api.logger,
+        });
       },
       { commands: ["tmux-watch"] },
     );

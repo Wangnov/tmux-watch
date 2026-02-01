@@ -14,7 +14,9 @@ type ToolParams = {
   note?: string;
   sessionKey?: string;
   socket?: string;
+  captureIntervalSeconds?: number;
   intervalMs?: number;
+  stableCount?: number;
   stableSeconds?: number;
   captureLines?: number;
   stripAnsi?: boolean;
@@ -82,8 +84,18 @@ export function createTmuxWatchTool(manager: TmuxWatchManager) {
         ),
         sessionKey: Type.Optional(Type.String({ description: "Session key override." })),
         socket: Type.Optional(Type.String({ description: "tmux socket path (for -S)." })),
-        intervalMs: Type.Optional(Type.Number({ description: "Polling interval in ms." })),
-        stableSeconds: Type.Optional(Type.Number({ description: "Stable duration in seconds." })),
+        captureIntervalSeconds: Type.Optional(
+          Type.Number({ description: "Capture interval in seconds." }),
+        ),
+        intervalMs: Type.Optional(
+          Type.Number({ description: "Legacy: capture interval in ms." }),
+        ),
+        stableCount: Type.Optional(
+          Type.Number({ description: "Consecutive identical captures before alert." }),
+        ),
+        stableSeconds: Type.Optional(
+          Type.Number({ description: "Legacy: stable duration in seconds." }),
+        ),
         captureLines: Type.Optional(Type.Number({ description: "Lines to capture." })),
         stripAnsi: Type.Optional(Type.Boolean({ description: "Strip ANSI escape codes." })),
         enabled: Type.Optional(Type.Boolean({ description: "Enable or disable subscription." })),
@@ -125,8 +137,14 @@ export function createTmuxWatchTool(manager: TmuxWatchManager) {
               note: readString(params.note),
               sessionKey: readString(params.sessionKey),
               socket: readString(params.socket),
+              captureIntervalSeconds:
+                typeof params.captureIntervalSeconds === "number"
+                  ? params.captureIntervalSeconds
+                  : undefined,
               intervalMs:
                 typeof params.intervalMs === "number" ? params.intervalMs : undefined,
+              stableCount:
+                typeof params.stableCount === "number" ? params.stableCount : undefined,
               stableSeconds:
                 typeof params.stableSeconds === "number" ? params.stableSeconds : undefined,
               captureLines:

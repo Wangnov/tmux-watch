@@ -3,6 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
+  DEFAULT_CAPTURE_INTERVAL_SECONDS,
+  DEFAULT_STABLE_COUNT,
   resolveTmuxWatchConfig,
   type NotifyMode,
   type NotifyTarget,
@@ -16,7 +18,9 @@ export type TmuxWatchSubscription = {
   target: string;
   socket?: string;
   sessionKey?: string;
+  captureIntervalSeconds?: number;
   intervalMs?: number;
+  stableCount?: number;
   stableSeconds?: number;
   captureLines?: number;
   stripAnsi?: boolean;
@@ -92,7 +96,7 @@ export class TmuxWatchManager {
 
   constructor(api: OpenClawPluginApi) {
     this.api = api;
-    this.config = resolveTmuxWatchConfig(api.pluginConfig, api.config);
+    this.config = resolveTmuxWatchConfig(api.pluginConfig);
   }
 
   async start(ctx: OpenClawPluginServiceContext): Promise<void> {
@@ -100,7 +104,7 @@ export class TmuxWatchManager {
       this.api.logger.info("[tmux-watch] disabled via config");
       return;
     }
-    this.stateDir = ctx.stateDir;
+    this.stateDir = ctx.stateDir ?? null;
     this.active = true;
     await this.ensureLoaded();
     await this.ensureTmuxAvailable();
@@ -367,7 +371,9 @@ export class TmuxWatchManager {
         threadId: primary.threadId,
       },
       outputTruncated: outputInfo.truncated,
-      stableSeconds: resolveStableSeconds(subscription, this.config),
+      stableCount: resolveStableCount(subscription, this.config),
+      captureIntervalSeconds: resolveIntervalMs(subscription, this.config) / 1000,
+      stableDurationSeconds: resolveStableDurationSeconds(subscription, this.config),
       intervalMs: resolveIntervalMs(subscription, this.config),
       capturedAt: new Date().toISOString(),
     };
@@ -416,7 +422,7 @@ export class TmuxWatchManager {
       cfg: this.api.config,
       dispatcherOptions: {
         deliver: async () => {},
-        onError: (err) => {
+        onError: (err: unknown) => {
           this.api.logger.warn(
             `[tmux-watch] dispatch error: ${err instanceof Error ? err.message : String(err)}`,
           );
@@ -553,26 +559,66 @@ function createRuntime(): WatchRuntime {
   };
 }
 
-function resolveIntervalMs(subscription: TmuxWatchSubscription, cfg: TmuxWatchConfig): number {
+export function resolveIntervalMs(
+  subscription: TmuxWatchSubscription,
+  cfg: TmuxWatchConfig,
+): number {
+  const captureIntervalSeconds =
+    typeof subscription.captureIntervalSeconds === "number" &&
+    Number.isFinite(subscription.captureIntervalSeconds)
+      ? subscription.captureIntervalSeconds
+      : typeof cfg.captureIntervalSeconds === "number" && Number.isFinite(cfg.captureIntervalSeconds)
+        ? cfg.captureIntervalSeconds
+        : undefined;
+  if (typeof captureIntervalSeconds === "number") {
+    return Math.max(200, Math.trunc(captureIntervalSeconds * 1000));
+  }
   const raw =
     typeof subscription.intervalMs === "number" && Number.isFinite(subscription.intervalMs)
       ? subscription.intervalMs
-      : cfg.pollIntervalMs;
+      : typeof cfg.pollIntervalMs === "number" && Number.isFinite(cfg.pollIntervalMs)
+        ? cfg.pollIntervalMs
+        : DEFAULT_CAPTURE_INTERVAL_SECONDS * 1000;
   return Math.max(200, Math.trunc(raw));
 }
 
-function resolveStableSeconds(subscription: TmuxWatchSubscription, cfg: TmuxWatchConfig): number {
-  const raw =
+export function resolveStableCount(
+  subscription: TmuxWatchSubscription,
+  cfg: TmuxWatchConfig,
+): number {
+  const rawCount =
+    typeof subscription.stableCount === "number" && Number.isFinite(subscription.stableCount)
+      ? subscription.stableCount
+      : typeof cfg.stableCount === "number" && Number.isFinite(cfg.stableCount)
+        ? cfg.stableCount
+        : undefined;
+  if (typeof rawCount === "number") {
+    return Math.max(1, Math.trunc(rawCount));
+  }
+  const stableSeconds =
     typeof subscription.stableSeconds === "number" && Number.isFinite(subscription.stableSeconds)
       ? subscription.stableSeconds
-      : cfg.stableSeconds;
-  return Math.max(1, raw);
+      : typeof cfg.stableSeconds === "number" && Number.isFinite(cfg.stableSeconds)
+        ? cfg.stableSeconds
+        : undefined;
+  if (typeof stableSeconds === "number") {
+    const intervalMs = resolveIntervalMs(subscription, cfg);
+    return Math.max(1, Math.ceil((stableSeconds * 1000) / intervalMs));
+  }
+  return DEFAULT_STABLE_COUNT;
 }
 
 function resolveStableTicks(subscription: TmuxWatchSubscription, cfg: TmuxWatchConfig): number {
+  return resolveStableCount(subscription, cfg);
+}
+
+export function resolveStableDurationSeconds(
+  subscription: TmuxWatchSubscription,
+  cfg: TmuxWatchConfig,
+): number {
   const intervalMs = resolveIntervalMs(subscription, cfg);
-  const stableSeconds = resolveStableSeconds(subscription, cfg);
-  return Math.max(1, Math.ceil((stableSeconds * 1000) / intervalMs));
+  const stableCount = resolveStableCount(subscription, cfg);
+  return (stableCount * intervalMs) / 1000;
 }
 
 function resolveCaptureLines(subscription: TmuxWatchSubscription, cfg: TmuxWatchConfig): number {
@@ -631,14 +677,16 @@ function sanitizeSubscriptionInput(
   const notifyTargets = Array.isArray(input.notify?.targets)
     ? sanitizeTargets(input.notify?.targets)
     : undefined;
-    return {
-      id: input.id?.trim() ?? "",
-      label: typeof input.label === "string" ? input.label.trim() : undefined,
-      note: typeof input.note === "string" ? input.note.trim() : undefined,
-      target: input.target.trim(),
+  return {
+    id: input.id?.trim() ?? "",
+    label: typeof input.label === "string" ? input.label.trim() : undefined,
+    note: typeof input.note === "string" ? input.note.trim() : undefined,
+    target: input.target.trim(),
     socket: typeof input.socket === "string" ? input.socket.trim() : undefined,
     sessionKey: typeof input.sessionKey === "string" ? input.sessionKey.trim() : undefined,
+    captureIntervalSeconds: input.captureIntervalSeconds,
     intervalMs: input.intervalMs,
+    stableCount: input.stableCount,
     stableSeconds: input.stableSeconds,
     captureLines: input.captureLines,
     stripAnsi: input.stripAnsi,
@@ -725,9 +773,11 @@ function hashOutput(output: string): string {
   return createHash("sha256").update(output).digest("hex");
 }
 
-function stripAnsi(input: string): string {
-  const sgr = /\x1b\[[0-9;]*m/g;
-  const osc8 = /\x1b\]8;;.*?\x1b\\|\x1b\]8;;\x1b\\/g;
+export function stripAnsi(input: string): string {
+  /* eslint-disable no-control-regex */
+  const sgr = new RegExp("\\u001b\\[[0-9;]*m", "g");
+  const osc8 = new RegExp("\\u001b]8;;.*?\\u001b\\\\|\\u001b]8;;\\u001b\\\\", "g");
+  /* eslint-enable no-control-regex */
   return input.replace(osc8, "").replace(sgr, "");
 }
 
@@ -748,7 +798,10 @@ function parseThreadId(value: unknown): string | number | undefined {
   return trimmed;
 }
 
-function truncateOutput(text: string, maxChars: number): { text: string; truncated: boolean } {
+export function truncateOutput(
+  text: string,
+  maxChars: number,
+): { text: string; truncated: boolean } {
   if (!text) {
     return { text: "", truncated: false };
   }

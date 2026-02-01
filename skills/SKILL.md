@@ -8,7 +8,7 @@ metadata:
 # tmux-watch Skill (OpenClaw)
 
 Use this skill to manage tmux-watch subscriptions. tmux-watch polls tmux pane output and triggers a
-message to the agent when the output stays unchanged for a configured number of seconds.
+message to the agent when the output stays unchanged for a configured number of consecutive captures.
 
 ## Core rules
 
@@ -73,8 +73,8 @@ tmux capture-pane -p -J -t <session:window.pane> -S -200
   "target": "session:0.0",
   "label": "my-job",
   "sessionKey": "main",
-  "intervalMs": 1000,
-  "stableSeconds": 5,
+  "captureIntervalSeconds": 10,
+  "stableCount": 6,
   "captureLines": 200,
   "stripAnsi": true
 }
