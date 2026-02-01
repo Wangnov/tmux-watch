@@ -1,0 +1,45 @@
+{
+  "id": "tmux-watch",
+  "name": "tmux-watch",
+  "description": "Watch tmux panes and notify the agent when output stays stable.",
+  "skills": ["./skills"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean", "default": true },
+      "pollIntervalMs": { "type": "number", "default": 1000 },
+      "stableSeconds": { "type": "number", "default": 5 },
+      "captureLines": { "type": "number", "default": 200 },
+      "stripAnsi": { "type": "boolean", "default": true },
+      "maxOutputChars": { "type": "number", "default": 4000 },
+      "sessionKey": { "type": "string" },
+      "socket": { "type": "string" },
+      "notify": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": ["last", "targets", "targets+last"],
+            "default": "last"
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "channel": { "type": "string" },
+                "target": { "type": "string" },
+                "accountId": { "type": "string" },
+                "threadId": { "type": "string" },
+                "label": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

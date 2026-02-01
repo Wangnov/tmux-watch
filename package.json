@@ -1,0 +1,20 @@
+{
+  "name": "tmux-watch",
+  "version": "2026.2.1",
+  "type": "module",
+  "description": "OpenClaw tmux output watchdog plugin",
+  "license": "MIT",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "install": {
+      "npmSpec": "tmux-watch",
+      "localPath": ".",
+      "defaultChoice": "npm"
+    }
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.1.29"
+  }
+}
