@@ -1,5 +1,3 @@
-import { Type } from "@sinclair/typebox";
-import { stringEnum } from "openclaw/plugin-sdk";
 import type { NotifyMode, NotifyTarget } from "./config.js";
 import type { TmuxWatchManager, TmuxWatchSubscription } from "./manager.js";
 
@@ -73,55 +71,54 @@ export function createTmuxWatchTool(manager: TmuxWatchManager) {
     name: "tmux-watch",
     description:
       "Manage tmux-watch subscriptions (add/remove/list) that monitor tmux pane output.",
-    parameters: Type.Object(
-      {
-        action: stringEnum(ACTIONS, { description: `Action to perform: ${ACTIONS.join(", ")}` }),
-        id: Type.Optional(Type.String({ description: "Subscription id." })),
-        target: Type.Optional(Type.String({ description: "tmux target, e.g. session:0.0" })),
-        label: Type.Optional(Type.String({ description: "Human-friendly label." })),
-        note: Type.Optional(
-          Type.String({ description: "Purpose/intent note shown to the agent on alert." }),
-        ),
-        sessionKey: Type.Optional(Type.String({ description: "Session key override." })),
-        socket: Type.Optional(Type.String({ description: "tmux socket path (for -S)." })),
-        captureIntervalSeconds: Type.Optional(
-          Type.Number({ description: "Capture interval in seconds." }),
-        ),
-        intervalMs: Type.Optional(
-          Type.Number({ description: "Legacy: capture interval in ms." }),
-        ),
-        stableCount: Type.Optional(
-          Type.Number({ description: "Consecutive identical captures before alert." }),
-        ),
-        stableSeconds: Type.Optional(
-          Type.Number({ description: "Legacy: stable duration in seconds." }),
-        ),
-        captureLines: Type.Optional(Type.Number({ description: "Lines to capture." })),
-        stripAnsi: Type.Optional(Type.Boolean({ description: "Strip ANSI escape codes." })),
-        enabled: Type.Optional(Type.Boolean({ description: "Enable or disable subscription." })),
-        notifyMode: Type.Optional(
-          stringEnum(NOTIFY_MODES, { description: "Notify mode override." }),
-        ),
-        targets: Type.Optional(
-          Type.Array(
-            Type.Object(
-              {
-                channel: Type.String({ description: "Channel id (e.g. telegram, gewe)." }),
-                target: Type.String({ description: "Channel target id." }),
-                accountId: Type.Optional(Type.String({ description: "Provider account id." })),
-                threadId: Type.Optional(Type.String({ description: "Thread id." })),
-                label: Type.Optional(Type.String({ description: "Label for this target." })),
-              },
-              { additionalProperties: false },
-            ),
-          ),
-        ),
-        includeOutput: Type.Optional(
-          Type.Boolean({ description: "Include last captured output in list." }),
-        ),
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: "string",
+          enum: [...ACTIONS],
+          description: `Action to perform: ${ACTIONS.join(", ")}`,
+        },
+        id: { type: "string", description: "Subscription id." },
+        target: { type: "string", description: "tmux target, e.g. session:0.0" },
+        label: { type: "string", description: "Human-friendly label." },
+        note: { type: "string", description: "Purpose/intent note shown to the agent on alert." },
+        sessionKey: { type: "string", description: "Session key override." },
+        socket: { type: "string", description: "tmux socket path (for -S)." },
+        captureIntervalSeconds: { type: "number", description: "Capture interval in seconds." },
+        intervalMs: { type: "number", description: "Legacy: capture interval in ms." },
+        stableCount: {
+          type: "number",
+          description: "Consecutive identical captures before alert.",
+        },
+        stableSeconds: { type: "number", description: "Legacy: stable duration in seconds." },
+        captureLines: { type: "number", description: "Lines to capture." },
+        stripAnsi: { type: "boolean", description: "Strip ANSI escape codes." },
+        enabled: { type: "boolean", description: "Enable or disable subscription." },
+        notifyMode: {
+          type: "string",
+          enum: [...NOTIFY_MODES],
+          description: "Notify mode override.",
+        },
+        targets: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              channel: { type: "string", description: "Channel id (e.g. telegram, gewe)." },
+              target: { type: "string", description: "Channel target id." },
+              accountId: { type: "string", description: "Provider account id." },
+              threadId: { type: "string", description: "Thread id." },
+              label: { type: "string", description: "Label for this target." },
+            },
+          },
+        },
+        includeOutput: { type: "boolean", description: "Include last captured output in list." },
       },
-      { additionalProperties: false },
-    ),
+      required: ["action"],
+    },
     async execute(_id: string, params: ToolParams): Promise<ToolResult> {
       try {
         switch (params.action) {
