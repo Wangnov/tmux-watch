@@ -112,6 +112,7 @@ tmux capture-pane -p -J -e -t <session:window.pane> -S -200 | freeze -o out.png
   "action": "add",
   "target": "session:0.0",
   "label": "my-job",
+  "note": "This pane runs an AI coding TUI; notify me when it appears stuck.",
   "sessionKey": "main",
   "captureIntervalSeconds": 10,
   "stableCount": 6,
