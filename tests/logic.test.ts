@@ -9,6 +9,7 @@ import {
   resolveIntervalMs,
   resolveStableCount,
   resolveStableDurationSeconds,
+  resolveLastTargetsFromStore,
   stripAnsi,
   truncateOutput,
 } from "../src/manager.js";
@@ -101,4 +102,47 @@ test("truncateOutput leaves short text untouched", () => {
   const result = truncateOutput(text, 200);
   assert.equal(result.truncated, false);
   assert.equal(result.text, text);
+});
+
+test("resolveLastTargetsFromStore falls back to latest external when last is webchat", () => {
+  const store = {
+    "agent:main:main": {
+      updatedAt: 5,
+      deliveryContext: { channel: "webchat", to: "webchat:client" },
+    },
+    "agent:main:gewe": {
+      updatedAt: 3,
+      deliveryContext: { channel: "gewe-openclaw", to: "gewe-openclaw:wxid_a" },
+    },
+    "agent:main:telegram": {
+      updatedAt: 4,
+      deliveryContext: { channel: "telegram", to: "123" },
+    },
+  };
+  const targets = resolveLastTargetsFromStore({
+    store,
+    sessionKey: "agent:main:main",
+  });
+  assert.equal(targets.length, 2);
+  assert.equal(targets[0]?.channel, "webchat");
+  assert.equal(targets[1]?.channel, "telegram");
+});
+
+test("resolveLastTargetsFromStore uses last external directly", () => {
+  const store = {
+    "agent:main:main": {
+      updatedAt: 5,
+      deliveryContext: { channel: "gewe-openclaw", to: "gewe-openclaw:wxid_a" },
+    },
+    "agent:main:web": {
+      updatedAt: 6,
+      deliveryContext: { channel: "webchat", to: "webchat:client" },
+    },
+  };
+  const targets = resolveLastTargetsFromStore({
+    store,
+    sessionKey: "agent:main:main",
+  });
+  assert.equal(targets.length, 1);
+  assert.equal(targets[0]?.channel, "gewe-openclaw");
 });

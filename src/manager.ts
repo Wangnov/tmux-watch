@@ -53,22 +53,23 @@ type WatchEntry = {
   runtime: WatchRuntime;
 };
 
-type ResolvedTarget = {
+export type ResolvedTarget = {
   channel: string;
   target: string;
   accountId?: string;
   threadId?: string | number;
   label?: string;
-  source: "targets" | "last";
+  source: "targets" | "last" | "last-fallback";
 };
 
-type SessionEntryLike = {
+export type SessionEntryLike = {
   deliveryContext?: {
     channel?: string;
     to?: string;
     accountId?: string;
     threadId?: string | number;
   };
+  updatedAt?: number;
   lastChannel?: string;
   lastTo?: string;
   lastAccountId?: string;
@@ -83,6 +84,7 @@ type MinimalConfig = {
 };
 
 const STATE_VERSION = 1;
+const INTERNAL_LAST_CHANNELS = new Set(["webchat", "tui"]);
 
 export class TmuxWatchManager {
   private readonly api: OpenClawPluginApi;
@@ -455,60 +457,26 @@ export class TmuxWatchManager {
     }
 
     if (includeLast) {
-      const last = await this.resolveLastTarget(sessionKey);
-      if (last) {
-        targets.push({
-          ...last,
-          source: "last",
-        });
+      const lastTargets = await this.resolveLastTargets(sessionKey);
+      if (lastTargets.length > 0) {
+        targets.push(...lastTargets);
       }
     }
 
     return dedupeTargets(targets);
   }
 
-  private async resolveLastTarget(sessionKey: string): Promise<ResolvedTarget | null> {
-    const entry = await this.readSessionEntry(sessionKey);
-    if (!entry) {
-      return null;
+  private async resolveLastTargets(sessionKey: string): Promise<ResolvedTarget[]> {
+    const store = await this.readSessionStore(sessionKey);
+    if (!store) {
+      return [];
     }
-    const delivery = entry.deliveryContext ?? {};
-    const channel =
-      typeof delivery.channel === "string"
-        ? delivery.channel.trim()
-        : typeof entry.lastChannel === "string"
-          ? entry.lastChannel.trim()
-          : typeof entry.channel === "string"
-            ? entry.channel.trim()
-            : undefined;
-    const target =
-      typeof delivery.to === "string"
-        ? delivery.to.trim()
-        : typeof entry.lastTo === "string"
-          ? entry.lastTo.trim()
-          : undefined;
-    if (!channel || !target) {
-      return null;
-    }
-    const accountId =
-      typeof delivery.accountId === "string"
-        ? delivery.accountId.trim()
-        : typeof entry.lastAccountId === "string"
-          ? entry.lastAccountId.trim()
-          : undefined;
-    const threadId =
-      delivery.threadId ?? entry.lastThreadId ?? entry.origin?.threadId ?? undefined;
-    return {
-      channel,
-      target,
-      accountId: accountId || undefined,
-      threadId: parseThreadId(threadId),
-      label: undefined,
-      source: "last",
-    };
+    return resolveLastTargetsFromStore({ store, sessionKey });
   }
 
-  private async readSessionEntry(sessionKey: string): Promise<SessionEntryLike | null> {
+  private async readSessionStore(
+    sessionKey: string,
+  ): Promise<Record<string, SessionEntryLike> | null> {
     const agentId = resolveAgentIdFromSessionKey(sessionKey);
     const storePath = this.api.runtime.channel.session.resolveStorePath(
       this.api.config.session?.store,
@@ -520,8 +488,10 @@ export class TmuxWatchManager {
       if (!store || typeof store !== "object") {
         return null;
       }
-      return store[sessionKey] ?? store[sessionKey.toLowerCase()] ?? null;
-    } catch {
+      return store;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.api.logger.warn(`[tmux-watch] session store read failed: ${message}`);
       return null;
     }
   }
@@ -767,6 +737,125 @@ function normalizeSessionKey(input: string | undefined, cfg?: MinimalConfig) {
   const defaultKey = resolveDefaultSessionKey(cfg);
   const agentId = resolveAgentIdFromSessionKey(defaultKey);
   return `agent:${normalizeAgentId(agentId)}:${lowered}`;
+}
+
+type TargetSnapshot = {
+  channel: string;
+  target: string;
+  accountId?: string;
+  threadId?: string | number;
+};
+
+function isInternalLastChannel(channel: string | undefined): boolean {
+  if (!channel) {
+    return false;
+  }
+  return INTERNAL_LAST_CHANNELS.has(channel.trim().toLowerCase());
+}
+
+function extractTargetSnapshot(entry: SessionEntryLike): TargetSnapshot | null {
+  const delivery = entry.deliveryContext ?? {};
+  const channel =
+    typeof delivery.channel === "string"
+      ? delivery.channel.trim()
+      : typeof entry.lastChannel === "string"
+        ? entry.lastChannel.trim()
+        : typeof entry.channel === "string"
+          ? entry.channel.trim()
+          : undefined;
+  const target =
+    typeof delivery.to === "string"
+      ? delivery.to.trim()
+      : typeof entry.lastTo === "string"
+        ? entry.lastTo.trim()
+        : undefined;
+  if (!channel || !target) {
+    return null;
+  }
+  const accountId =
+    typeof delivery.accountId === "string"
+      ? delivery.accountId.trim()
+      : typeof entry.lastAccountId === "string"
+        ? entry.lastAccountId.trim()
+        : undefined;
+  const threadId =
+    delivery.threadId ?? entry.lastThreadId ?? entry.origin?.threadId ?? undefined;
+  return {
+    channel,
+    target,
+    accountId: accountId || undefined,
+    threadId,
+  };
+}
+
+function snapshotKey(snapshot: TargetSnapshot): string {
+  return [snapshot.channel, snapshot.target, snapshot.accountId ?? "", snapshot.threadId ?? ""].join(
+    "|",
+  );
+}
+
+function findLatestExternalTarget(
+  store: Record<string, SessionEntryLike>,
+  exclude: TargetSnapshot,
+): TargetSnapshot | null {
+  const excludeKey = snapshotKey(exclude);
+  let best: { updatedAt: number; target: TargetSnapshot } | null = null;
+  for (const entry of Object.values(store)) {
+    const snapshot = extractTargetSnapshot(entry);
+    if (!snapshot) {
+      continue;
+    }
+    if (isInternalLastChannel(snapshot.channel)) {
+      continue;
+    }
+    if (snapshotKey(snapshot) === excludeKey) {
+      continue;
+    }
+    const updatedAt = typeof entry.updatedAt === "number" ? entry.updatedAt : 0;
+    if (!best || updatedAt > best.updatedAt) {
+      best = { updatedAt, target: snapshot };
+    }
+  }
+  return best?.target ?? null;
+}
+
+function toResolvedTarget(
+  snapshot: TargetSnapshot,
+  source: ResolvedTarget["source"],
+): ResolvedTarget {
+  return {
+    channel: snapshot.channel,
+    target: snapshot.target,
+    accountId: snapshot.accountId,
+    threadId: parseThreadId(snapshot.threadId),
+    label: undefined,
+    source,
+  };
+}
+
+export function resolveLastTargetsFromStore(params: {
+  store: Record<string, SessionEntryLike>;
+  sessionKey: string;
+}): ResolvedTarget[] {
+  const entry =
+    params.store[params.sessionKey] ??
+    params.store[params.sessionKey.toLowerCase()] ??
+    null;
+  if (!entry) {
+    return [];
+  }
+  const primary = extractTargetSnapshot(entry);
+  if (!primary) {
+    return [];
+  }
+  const targets: ResolvedTarget[] = [toResolvedTarget(primary, "last")];
+  if (isInternalLastChannel(primary.channel)) {
+    const fallback = findLatestExternalTarget(params.store, primary);
+    if (fallback) {
+      targets.push(toResolvedTarget(fallback, "last-fallback"));
+    }
+  }
+  return targets;
 }
 
 function hashOutput(output: string): string {
