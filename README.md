@@ -5,7 +5,7 @@
 <a id="zh"></a>
 ## 中文
 
-基于 tmux 输出的稳定性监测插件：当某个 pane 的输出在连续 N 次捕获中保持不变时，触发告警并唤醒 Agent，总结并通知你。
+这是一个 [OpenClaw](https://github.com/OpenClaw/OpenClaw) 插件，用于基于 tmux 输出的稳定性监测：当某个 pane 的输出在连续 N 次捕获中保持不变时，触发告警并唤醒 Agent，总结并通知你。
 
 ### 安装
 
@@ -171,7 +171,7 @@ openclaw tmux-watch capture session:0.0 --format image --output /tmp/pane.png
 <a id="en"></a>
 ## English
 
-tmux-watch monitors a tmux pane and triggers an alert when the output stays unchanged for N consecutive captures.
+This is an [OpenClaw](https://github.com/OpenClaw/OpenClaw) plugin. tmux-watch monitors a tmux pane and triggers an alert when the output stays unchanged for N consecutive captures.
 The agent is woken up to summarize the last output and notify you.
 
 ### Install
