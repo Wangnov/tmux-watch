@@ -30,7 +30,7 @@ export const DEFAULT_STABLE_COUNT = 6;
 
 const DEFAULTS: Omit<TmuxWatchConfig, "captureIntervalSeconds" | "pollIntervalMs" | "stableCount" | "stableSeconds"> = {
   enabled: true,
-  captureLines: 200,
+  captureLines: 50,
   stripAnsi: true,
   maxOutputChars: 4000,
   sessionKey: undefined,

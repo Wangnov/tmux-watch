@@ -25,14 +25,14 @@ tmux list-sessions
 tmux list-windows -t <session>
 tmux list-panes -t <session>
 tmux list-panes -a
-tmux capture-pane -p -J -t <session:window.pane> -S -200
+tmux capture-pane -p -J -t <session:window.pane> -S -50
 ```
 
 If a custom socket is used:
 
 ```bash
 tmux -S /path/to/socket list-sessions
-tmux -S /path/to/socket capture-pane -p -J -t <session:window.pane> -S -200
+tmux -S /path/to/socket capture-pane -p -J -t <session:window.pane> -S -50
 ```
 
 ## Controlling a TUI in tmux (high-signal tips)
@@ -40,7 +40,7 @@ tmux -S /path/to/socket capture-pane -p -J -t <session:window.pane> -S -200
 - Prefer `openclaw tmux-watch send` for reliable input (two-step, default 20ms delay).
 - Use `C-c` to interrupt a stuck process; use `C-m` (Enter) to submit commands.
 - For TUIs, avoid rapid key spam; send a small sequence, then capture output to verify state.
-- Use `capture-pane -p -J -S -200` to get recent context before and after an action.
+- Use `capture-pane -p -J -S -50` to get recent context before and after an action.
 - If the TUI supports it, use built-in refresh keys (often `r` or `Ctrl+l`).
 
 Examples:
@@ -56,8 +56,8 @@ tmux send-keys -t <session:window.pane> C-c
 tmux send-keys -t <session:window.pane> r
 tmux send-keys -t <session:window.pane> C-l
 
-# Capture the last 200 lines to verify state
-tmux capture-pane -p -J -t <session:window.pane> -S -200
+# Capture the last 50 lines to verify state
+tmux capture-pane -p -J -t <session:window.pane> -S -50
 ```
 
 ## Screenshot capture (preferred)
@@ -121,7 +121,7 @@ Notes:
   "sessionKey": "main",
   "captureIntervalSeconds": 10,
   "stableCount": 6,
-  "captureLines": 200,
+  "captureLines": 50,
   "stripAnsi": true
 }
 ```
@@ -159,7 +159,7 @@ Optional routing overrides:
   "action": "capture",
   "target": "session:0.0",
   "format": "both",
-  "captureLines": 200,
+  "captureLines": 50,
   "stripAnsi": true,
   "imageFormat": "png",
   "base64": false

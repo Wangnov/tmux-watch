@@ -49,7 +49,7 @@ openclaw plugins install ./tmux-watch.tgz
           "socket": "/private/tmp/tmux-501/default",
           "captureIntervalSeconds": 10,
           "stableCount": 6,
-          "captureLines": 200,
+          "captureLines": 50,
           "stripAnsi": true,
           "maxOutputChars": 4000,
           "notify": {
@@ -73,7 +73,7 @@ openclaw plugins install ./tmux-watch.tgz
 - `stableCount`：连续多少次捕获内容一致才触发告警，默认 `6`。总时长 = `captureIntervalSeconds × stableCount`（例如 `3 × 5 = 15s`）。
 - `pollIntervalMs`：**兼容字段**，捕获间隔（毫秒）。仅在需要与旧配置兼容时使用。
 - `stableSeconds`：**兼容字段**，稳定时长（秒）。会按当前捕获间隔换算成次数。
-- `captureLines`：从 pane 末尾向上截取的行数（默认 `200`）。
+- `captureLines`：从 pane 末尾向上截取的行数（默认 `50`）。
 - `stripAnsi`：是否剥离 ANSI 转义码（默认 `true`）。
 - `maxOutputChars`：通知中最多包含的输出字符数（默认 `4000`，超出将从末尾截断）。
 - `sessionKey`：覆盖默认 Agent 会话（通常不需要改）。
@@ -216,7 +216,7 @@ Edit `~/.openclaw/openclaw.json`:
           "socket": "/private/tmp/tmux-501/default",
           "captureIntervalSeconds": 10,
           "stableCount": 6,
-          "captureLines": 200,
+          "captureLines": 50,
           "stripAnsi": true,
           "maxOutputChars": 4000,
           "notify": {
@@ -240,7 +240,7 @@ Edit `~/.openclaw/openclaw.json`:
 - `stableCount`: Number of consecutive identical captures before alert (default `6`). Total duration = `captureIntervalSeconds × stableCount` (for example `3 × 5 = 15s`).
 - `pollIntervalMs`: **Legacy** capture interval in milliseconds. Use only for backward compatibility.
 - `stableSeconds`: **Legacy** stable duration in seconds. Converted into counts using the current interval.
-- `captureLines`: Lines captured from the bottom of the pane (default `200`).
+- `captureLines`: Lines captured from the bottom of the pane (default `50`).
 - `stripAnsi`: Strip ANSI escape codes (default `true`).
 - `maxOutputChars`: Max output chars in the notification (default `4000`, tail-truncated).
 - `sessionKey`: Override the default agent session (rare).
