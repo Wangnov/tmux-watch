@@ -65,6 +65,13 @@ tmux capture-pane -p -J -t <session:window.pane> -S -200
 Use `openclaw tmux-watch capture` to capture text/images from a tmux target. The plugin selects
 `cryosnap` first, then falls back to `freeze`.
 
+Default behavior when the user says "截图" (screenshot):
+
+- Use `format=image` by default.
+- Only use `format=text` if the user explicitly asks for text output.
+- Do not return only a file path. **After capturing an image, immediately send the image via the
+  same channel used by the user.**
+
 Priority detection order:
 
 1. System-level PATH (`cryosnap` / `freeze`)
@@ -98,6 +105,8 @@ Notes:
 
 - Temporary images default to a 10-minute TTL. Override with `--ttl-seconds`.
 - Use `--image-format png|svg|webp` to select output format.
+- If an image is captured, send the image immediately using the channel’s image-send capability
+  (not just a path).
 
 ## Tool: tmux-watch
 
