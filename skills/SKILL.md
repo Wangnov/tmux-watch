@@ -65,7 +65,7 @@ tmux capture-pane -p -J -t <session:window.pane> -S -200
 Use `openclaw tmux-watch capture` to capture text/images from a tmux target. The plugin selects
 `cryosnap` first, then falls back to `freeze`.
 
-Default behavior when the user says "截图" (screenshot):
+Default behavior when the user asks for a screenshot:
 
 - Use `format=image` by default.
 - Only use `format=text` if the user explicitly asks for text output.
