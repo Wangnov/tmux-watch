@@ -4,6 +4,7 @@ import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { createTmuxWatchManager } from "./manager.js";
 import { installTool, removeTool, type ToolId } from "./tool-install.js";
+import { normalizeTmuxSocket } from "./socket.js";
 
 type Logger = {
   info: (message: string) => void;
@@ -17,15 +18,7 @@ type PluginsConfig = {
 };
 
 function extractSocket(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return "";
-  }
-  const comma = trimmed.indexOf(",");
-  if (comma > 0) {
-    return trimmed.slice(0, comma);
-  }
-  return trimmed;
+  return normalizeTmuxSocket(raw) ?? "";
 }
 
 function printSocketHelp(logger: Logger) {

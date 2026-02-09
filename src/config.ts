@@ -1,3 +1,5 @@
+import { normalizeTmuxSocket } from "./socket.js";
+
 export type NotifyMode = "last" | "targets" | "targets+last";
 
 export type NotifyTarget = {
@@ -120,7 +122,7 @@ export function resolveTmuxWatchConfig(raw: unknown): TmuxWatchConfig {
     stripAnsi: readBoolean(value.stripAnsi, DEFAULTS.stripAnsi),
     maxOutputChars,
     sessionKey: readString(value.sessionKey) ?? DEFAULTS.sessionKey,
-    socket: readString(value.socket) ?? DEFAULTS.socket,
+    socket: normalizeTmuxSocket(value.socket) ?? DEFAULTS.socket,
     notify: {
       mode: normalizeNotifyMode(notifyRaw.mode, DEFAULTS.notify.mode),
       targets: normalizeTargets(notifyRaw.targets),

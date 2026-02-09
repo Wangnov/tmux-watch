@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { stripAnsi, truncateOutput } from "./text-utils.js";
 import { resolveBinaryName, resolveToolsDir, type ToolId } from "./tool-install.js";
+import { normalizeTmuxSocket } from "./socket.js";
 
 export type CaptureFormat = "text" | "image" | "both";
 export type ImageFormat = "png" | "svg" | "webp";
@@ -87,7 +88,7 @@ export async function captureTmux(params: {
   if (!target) {
     throw new Error("target required for capture");
   }
-  const socket = normalizeSocket(params.socket ?? params.config.socket);
+  const socket = normalizeTmuxSocket(params.socket ?? params.config.socket);
   const format = resolveCaptureFormat(params.format, params.outputPath);
   const captureLines = resolveCaptureLines(params.captureLines, params.config);
   const stripOutput = resolveStripAnsi(params.stripAnsi, params.config);
@@ -361,21 +362,6 @@ function resolveTtlSeconds(raw: unknown): number {
     }
   }
   return DEFAULT_TTL_SECONDS;
-}
-
-function normalizeSocket(raw: string | undefined): string | undefined {
-  if (!raw) {
-    return undefined;
-  }
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  const comma = trimmed.indexOf(",");
-  if (comma > 0) {
-    return trimmed.slice(0, comma);
-  }
-  return trimmed;
 }
 
 async function ensureTempDir(): Promise<string> {

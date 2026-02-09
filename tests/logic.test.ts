@@ -10,6 +10,7 @@ import {
   resolveStableCount,
   resolveStableDurationSeconds,
   resolveLastTargetsFromStore,
+  extractReplyText,
   stripAnsi,
   truncateOutput,
 } from "../src/manager.js";
@@ -144,4 +145,10 @@ test("resolveLastTargetsFromStore uses last external directly", () => {
   });
   assert.equal(targets.length, 1);
   assert.equal(targets[0]?.channel, "gewe-openclaw");
+});
+
+test("extractReplyText reads text from reply payload", () => {
+  assert.equal(extractReplyText({ text: "hello" }), "hello");
+  assert.equal(extractReplyText({ text: 123 }), undefined);
+  assert.equal(extractReplyText(null), undefined);
 });

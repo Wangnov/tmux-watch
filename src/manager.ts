@@ -12,6 +12,7 @@ import {
   type NotifyTarget,
   type TmuxWatchConfig,
 } from "./config.js";
+import { normalizeTmuxSocket } from "./socket.js";
 
 export type TmuxWatchSubscription = {
   id: string;
@@ -87,6 +88,7 @@ type MinimalConfig = {
 
 const STATE_VERSION = 1;
 const INTERNAL_LAST_CHANNELS = new Set(["webchat", "tui"]);
+const TMUX_RECHECK_INTERVAL_MS = 5000;
 
 export class TmuxWatchManager {
   private readonly api: OpenClawPluginApi;
@@ -95,8 +97,8 @@ export class TmuxWatchManager {
   private stateDir: string | null = null;
   private loaded = false;
   private active = false;
-  private tmuxChecked = false;
   private tmuxAvailable = false;
+  private tmuxLastCheckedAt = 0;
   private stateMtimeMs = 0;
   private stateSyncPromise: Promise<void> | null = null;
 
@@ -113,10 +115,7 @@ export class TmuxWatchManager {
     this.stateDir = ctx.stateDir ?? null;
     this.active = true;
     await this.ensureLoaded();
-    await this.ensureTmuxAvailable();
-    if (!this.tmuxAvailable) {
-      return;
-    }
+    await this.ensureTmuxAvailable({ force: true });
     for (const entry of this.entries.values()) {
       this.startWatch(entry);
     }
@@ -156,7 +155,7 @@ export class TmuxWatchManager {
   }
 
   async capture(params: CaptureParams): Promise<CaptureResult> {
-    await this.ensureTmuxAvailable();
+    await this.ensureTmuxAvailable({ force: true });
     if (!this.tmuxAvailable) {
       throw new Error("tmux not available");
     }
@@ -175,7 +174,7 @@ export class TmuxWatchManager {
     const runtime = existing?.runtime ?? createRuntime();
     this.entries.set(id, { subscription, runtime });
     await this.saveState();
-    if (this.active && this.tmuxAvailable && subscription.enabled !== false) {
+    if (this.active && subscription.enabled !== false) {
       this.startWatch(this.entries.get(id)!);
     } else if (existing) {
       this.stopWatchTimer(existing);
@@ -324,13 +323,13 @@ export class TmuxWatchManager {
           runtime: createRuntime(),
         };
         this.entries.set(id, entry);
-        if (this.active && this.tmuxAvailable && subscription.enabled !== false) {
+        if (this.active && subscription.enabled !== false) {
           this.startWatch(entry);
         }
         continue;
       }
       existing.subscription = subscription;
-      if (this.active && this.tmuxAvailable && subscription.enabled !== false) {
+      if (this.active && subscription.enabled !== false) {
         this.startWatch(existing);
       } else {
         this.stopWatchTimer(existing);
@@ -418,7 +417,10 @@ export class TmuxWatchManager {
 
   private async captureOutput(subscription: TmuxWatchSubscription): Promise<string | null> {
     if (!this.tmuxAvailable) {
-      return null;
+      await this.ensureTmuxAvailable();
+      if (!this.tmuxAvailable) {
+        return null;
+      }
     }
     const target = subscription.target.trim();
     if (!target) {
@@ -426,7 +428,7 @@ export class TmuxWatchManager {
     }
 
     const captureLines = resolveCaptureLines(subscription, this.config);
-    const socket = subscription.socket ?? this.config.socket;
+    const socket = normalizeTmuxSocket(subscription.socket ?? this.config.socket);
     const argv = socket
       ? ["tmux", "-S", socket, "capture-pane", "-p", "-J", "-t", target]
       : ["tmux", "capture-pane", "-p", "-J", "-t", target];
@@ -547,18 +549,118 @@ export class TmuxWatchManager {
       ChatType: "direct",
     };
 
-    await this.api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-      ctx,
-      cfg: this.api.config,
-      dispatcherOptions: {
-        deliver: async () => {},
-        onError: (err: unknown) => {
-          this.api.logger.warn(
-            `[tmux-watch] dispatch error: ${err instanceof Error ? err.message : String(err)}`,
-          );
+    let dispatchedPrimary = false;
+    try {
+      await this.api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+        ctx,
+        cfg: this.api.config,
+        dispatcherOptions: {
+          deliver: async (payload: unknown, info: { kind: string }) => {
+            if (info.kind !== "final") {
+              return;
+            }
+            const text = extractReplyText(payload);
+            if (!text) {
+              return;
+            }
+            await this.sendToTarget(primary, text);
+            dispatchedPrimary = true;
+          },
+          onError: (err: unknown) => {
+            this.api.logger.warn(
+              `[tmux-watch] dispatch error: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          },
         },
-      },
-    });
+      });
+    } catch (err) {
+      this.api.logger.warn(
+        `[tmux-watch] notify dispatch failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    if (!dispatchedPrimary) {
+      await this.sendToTarget(primary, body);
+    }
+
+    if (targets.length > 1) {
+      const mirrorText = body;
+      for (const target of targets.slice(1)) {
+        await this.sendToTarget(target, mirrorText);
+      }
+    }
+  }
+
+  private async sendToTarget(target: ResolvedTarget, text: string): Promise<void> {
+    const channel = target.channel.trim().toLowerCase();
+    if (!channel || !text.trim()) {
+      return;
+    }
+    const accountId = target.accountId?.trim() || undefined;
+    const threadId = parseThreadId(target.threadId);
+
+    try {
+      switch (channel) {
+        case "telegram": {
+          await this.api.runtime.channel.telegram.sendMessage(target.target, text, {
+            accountId,
+            messageThreadId: threadId,
+          });
+          return;
+        }
+        case "slack": {
+          await this.api.runtime.channel.slack.sendMessage(target.target, text, {
+            accountId,
+            threadTs: threadId != null ? String(threadId) : undefined,
+          });
+          return;
+        }
+        case "discord": {
+          await this.api.runtime.channel.discord.sendMessage(target.target, text, {
+            accountId,
+            replyTo: threadId != null ? String(threadId) : undefined,
+          });
+          return;
+        }
+        case "signal": {
+          await this.api.runtime.channel.signal.sendMessage(target.target, text, {
+            accountId,
+          });
+          return;
+        }
+        case "imessage": {
+          await this.api.runtime.channel.imessage.sendMessage(target.target, text, {
+            accountId,
+          });
+          return;
+        }
+        case "line": {
+          await this.api.runtime.channel.line.sendMessage(target.target, text, {
+            accountId,
+          });
+          return;
+        }
+        case "whatsapp":
+        case "gewe-openclaw":
+        case "web":
+        case "webchat": {
+          await this.api.runtime.channel.whatsapp.sendMessage(target.target, text, {
+            accountId,
+          });
+          return;
+        }
+        default: {
+          this.api.logger.warn(`[tmux-watch] unsupported notify channel: ${target.channel}`);
+          return;
+        }
+      }
+    } catch (err) {
+      this.api.logger.warn(
+        `[tmux-watch] send failed (${target.channel}:${target.target}): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 
   private async resolveNotifyTargets(
@@ -624,11 +726,12 @@ export class TmuxWatchManager {
     }
   }
 
-  private async ensureTmuxAvailable(): Promise<void> {
-    if (this.tmuxChecked) {
+  private async ensureTmuxAvailable(options?: { force?: boolean }): Promise<void> {
+    const now = Date.now();
+    if (!options?.force && now - this.tmuxLastCheckedAt < TMUX_RECHECK_INTERVAL_MS) {
       return;
     }
-    this.tmuxChecked = true;
+    this.tmuxLastCheckedAt = now;
     try {
       const res = await this.api.runtime.system.runCommandWithTimeout(["tmux", "-V"], {
         timeoutMs: 2000,
@@ -780,7 +883,7 @@ function sanitizeSubscriptionInput(
     label: typeof input.label === "string" ? input.label.trim() : undefined,
     note: typeof input.note === "string" ? input.note.trim() : undefined,
     target: input.target.trim(),
-    socket: typeof input.socket === "string" ? input.socket.trim() : undefined,
+    socket: normalizeTmuxSocket(input.socket),
     sessionKey: typeof input.sessionKey === "string" ? input.sessionKey.trim() : undefined,
     captureIntervalSeconds: input.captureIntervalSeconds,
     intervalMs: input.intervalMs,
@@ -1005,6 +1108,14 @@ function parseThreadId(value: unknown): string | number | undefined {
     return Number.parseInt(trimmed, 10);
   }
   return trimmed;
+}
+
+export function extractReplyText(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+  const value = payload as { text?: unknown };
+  return typeof value.text === "string" ? value.text : undefined;
 }
 
 export { stripAnsi, truncateOutput };
