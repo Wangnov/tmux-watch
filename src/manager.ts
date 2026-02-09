@@ -97,6 +97,8 @@ export class TmuxWatchManager {
   private active = false;
   private tmuxChecked = false;
   private tmuxAvailable = false;
+  private stateMtimeMs = 0;
+  private stateSyncPromise: Promise<void> | null = null;
 
   constructor(api: OpenClawPluginApi) {
     this.api = api;
@@ -123,10 +125,7 @@ export class TmuxWatchManager {
   async stop(): Promise<void> {
     this.active = false;
     for (const entry of this.entries.values()) {
-      if (entry.runtime.timer) {
-        clearInterval(entry.runtime.timer);
-        entry.runtime.timer = undefined;
-      }
+      this.stopWatchTimer(entry);
     }
   }
 
@@ -178,9 +177,8 @@ export class TmuxWatchManager {
     await this.saveState();
     if (this.active && this.tmuxAvailable && subscription.enabled !== false) {
       this.startWatch(this.entries.get(id)!);
-    } else if (existing?.runtime.timer) {
-      clearInterval(existing.runtime.timer);
-      existing.runtime.timer = undefined;
+    } else if (existing) {
+      this.stopWatchTimer(existing);
     }
     return subscription;
   }
@@ -191,10 +189,7 @@ export class TmuxWatchManager {
     if (!entry) {
       return false;
     }
-    if (entry.runtime.timer) {
-      clearInterval(entry.runtime.timer);
-      entry.runtime.timer = undefined;
-    }
+    this.stopWatchTimer(entry);
     this.entries.delete(id);
     await this.saveState();
     return true;
@@ -214,6 +209,7 @@ export class TmuxWatchManager {
         runtime: createRuntime(),
       });
     }
+    this.stateMtimeMs = await this.readStateMtimeMs();
     this.loaded = true;
   }
 
@@ -245,25 +241,143 @@ export class TmuxWatchManager {
       subscriptions: Array.from(this.entries.values()).map((entry) => entry.subscription),
     };
     await fs.writeFile(filePath, JSON.stringify(payload, null, 2));
+    this.stateMtimeMs = await this.readStateMtimeMs();
   }
 
-  private startWatch(entry: WatchEntry): void {
+  private async readStateMtimeMs(): Promise<number> {
+    const filePath = this.getStatePath();
+    try {
+      const stat = await fs.stat(filePath);
+      return stat.mtimeMs;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return 0;
+      }
+      return this.stateMtimeMs;
+    }
+  }
+
+  private async loadStateForSync(): Promise<PersistedState | null> {
+    const filePath = this.getStatePath();
+    try {
+      const raw = await fs.readFile(filePath, "utf8");
+      const parsed = JSON.parse(raw) as PersistedState;
+      if (!parsed || parsed.version !== STATE_VERSION || !Array.isArray(parsed.subscriptions)) {
+        return { version: STATE_VERSION, subscriptions: [] };
+      }
+      return parsed;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return { version: STATE_VERSION, subscriptions: [] };
+      }
+      return null;
+    }
+  }
+
+  private async syncStateFromDiskIfNeeded(): Promise<void> {
+    if (!this.loaded) {
+      return;
+    }
+    if (this.stateSyncPromise) {
+      await this.stateSyncPromise;
+      return;
+    }
+    this.stateSyncPromise = (async () => {
+      const mtimeMs = await this.readStateMtimeMs();
+      if (mtimeMs === this.stateMtimeMs) {
+        return;
+      }
+      const state = await this.loadStateForSync();
+      if (!state) {
+        return;
+      }
+      this.stateMtimeMs = mtimeMs;
+      this.reconcileEntriesFromState(state);
+    })().finally(() => {
+      this.stateSyncPromise = null;
+    });
+    await this.stateSyncPromise;
+  }
+
+  private reconcileEntriesFromState(state: PersistedState): void {
+    const nextSubscriptions = new Map<string, TmuxWatchSubscription>();
+    for (const subscription of state.subscriptions) {
+      if (!subscription.id || !subscription.target) {
+        continue;
+      }
+      nextSubscriptions.set(subscription.id, subscription);
+    }
+
+    for (const [id, entry] of this.entries) {
+      if (nextSubscriptions.has(id)) {
+        continue;
+      }
+      this.stopWatchTimer(entry);
+      this.entries.delete(id);
+    }
+
+    for (const [id, subscription] of nextSubscriptions) {
+      const existing = this.entries.get(id);
+      if (!existing) {
+        const entry: WatchEntry = {
+          subscription,
+          runtime: createRuntime(),
+        };
+        this.entries.set(id, entry);
+        if (this.active && this.tmuxAvailable && subscription.enabled !== false) {
+          this.startWatch(entry);
+        }
+        continue;
+      }
+      existing.subscription = subscription;
+      if (this.active && this.tmuxAvailable && subscription.enabled !== false) {
+        this.startWatch(existing);
+      } else {
+        this.stopWatchTimer(existing);
+      }
+    }
+  }
+
+  private isManagedEntry(entry: WatchEntry): boolean {
+    const id = entry.subscription.id;
+    if (!id) {
+      return false;
+    }
+    return this.entries.get(id) === entry;
+  }
+
+  private shouldWatchEntry(entry: WatchEntry): boolean {
+    return this.active && this.isManagedEntry(entry) && entry.subscription.enabled !== false;
+  }
+
+  private stopWatchTimer(entry: WatchEntry): void {
     if (entry.runtime.timer) {
       clearInterval(entry.runtime.timer);
       entry.runtime.timer = undefined;
     }
+  }
+
+  private startWatch(entry: WatchEntry): void {
+    this.stopWatchTimer(entry);
     if (entry.subscription.enabled === false) {
       return;
     }
     const intervalMs = resolveIntervalMs(entry.subscription, this.config);
     entry.runtime.timer = setInterval(() => {
-      void this.pollWatch(entry).catch((err) => {
+      void (async () => {
+        await this.syncStateFromDiskIfNeeded();
+        await this.pollWatch(entry);
+      })().catch((err) => {
         entry.runtime.lastError = err instanceof Error ? err.message : String(err);
       });
     }, intervalMs);
   }
 
   private async pollWatch(entry: WatchEntry): Promise<void> {
+    if (!this.shouldWatchEntry(entry)) {
+      this.stopWatchTimer(entry);
+      return;
+    }
     if (entry.runtime.running) {
       return;
     }
@@ -272,6 +386,10 @@ export class TmuxWatchManager {
       const output = await this.captureOutput(entry.subscription);
       if (output === null) {
         entry.runtime.stableTicks = 0;
+        return;
+      }
+      if (!this.shouldWatchEntry(entry)) {
+        this.stopWatchTimer(entry);
         return;
       }
       entry.runtime.lastCapturedAt = Date.now();
