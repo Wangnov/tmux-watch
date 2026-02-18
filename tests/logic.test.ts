@@ -54,6 +54,41 @@ function makeSub(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function makeApiForSendGuardTest(onTelegramSend: () => Promise<void> | void): OpenClawPluginApi {
+  return {
+    pluginConfig: {
+      enabled: true,
+      debug: false,
+      notify: { mode: "targets", targets: [] },
+    },
+    config: {
+      session: { scope: "agent", mainKey: "main" },
+      agents: { list: [{ id: "main", default: true }] },
+    },
+    logger: {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+    },
+    runtime: {
+      state: {
+        resolveStateDir: () => os.tmpdir(),
+      },
+      system: {
+        runCommandWithTimeout: async () => ({ code: 0, stdout: "", stderr: "" }),
+      },
+      channel: {
+        telegram: {
+          sendMessage: async () => {
+            await onTelegramSend();
+          },
+        },
+      },
+    },
+  } as unknown as OpenClawPluginApi;
+}
+
 async function waitFor(
   condition: () => Promise<boolean>,
   options?: { timeoutMs?: number; intervalMs?: number },
@@ -240,6 +275,59 @@ test("manager routes debug logs to debug channel", async () => {
     await manager.stop();
     await fs.rm(stateDir, { recursive: true, force: true });
   }
+});
+
+test("sendToTarget skips send when guard already stale", async () => {
+  let sendCount = 0;
+  const manager = createTmuxWatchManager(
+    makeApiForSendGuardTest(async () => {
+      sendCount += 1;
+    }),
+  ) as unknown as {
+    sendToTarget: (
+      target: { channel: string; target: string; source: "targets" },
+      text: string,
+      context?: { subscriptionId?: string; phase?: string },
+      canSend?: () => boolean,
+    ) => Promise<boolean>;
+  };
+  const sent = await manager.sendToTarget(
+    { channel: "telegram", target: "123", source: "targets" },
+    "hello",
+    { subscriptionId: "sub-1", phase: "primary-dispatch" },
+    () => false,
+  );
+  assert.equal(sent, false);
+  assert.equal(sendCount, 0);
+});
+
+test("sendToTarget aborts at last checkpoint when guard flips stale", async () => {
+  let sendCount = 0;
+  let guardChecks = 0;
+  const manager = createTmuxWatchManager(
+    makeApiForSendGuardTest(async () => {
+      sendCount += 1;
+    }),
+  ) as unknown as {
+    sendToTarget: (
+      target: { channel: string; target: string; source: "targets" },
+      text: string,
+      context?: { subscriptionId?: string; phase?: string },
+      canSend?: () => boolean,
+    ) => Promise<boolean>;
+  };
+  const sent = await manager.sendToTarget(
+    { channel: "telegram", target: "123", source: "targets" },
+    "hello",
+    { subscriptionId: "sub-1", phase: "primary-dispatch" },
+    () => {
+      guardChecks += 1;
+      return guardChecks < 2;
+    },
+  );
+  assert.equal(sent, false);
+  assert.equal(sendCount, 0);
+  assert.equal(guardChecks >= 2, true);
 });
 
 test("stripAnsi removes SGR and OSC8 sequences", () => {
