@@ -5,6 +5,7 @@ import {
   resolveCaptureFormat,
   resolveImageFormat,
 } from "../src/capture.js";
+import { normalizeTmuxSocket } from "../src/socket.js";
 
 test("resolveCaptureFormat defaults to text when no output path", () => {
   assert.equal(resolveCaptureFormat(undefined, undefined), "text");
@@ -28,4 +29,16 @@ test("pickTool prefers cryosnap over freeze", () => {
     { id: "cryosnap", path: "/bin/cryosnap", source: "path" },
   ]);
   assert.equal(tool?.id, "cryosnap");
+});
+
+test("normalizeTmuxSocket strips trailing TMUX suffix", () => {
+  assert.equal(
+    normalizeTmuxSocket("/private/tmp/tmux-501/default,3191,4"),
+    "/private/tmp/tmux-501/default",
+  );
+});
+
+test("normalizeTmuxSocket returns undefined for empty input", () => {
+  assert.equal(normalizeTmuxSocket("   "), undefined);
+  assert.equal(normalizeTmuxSocket(undefined), undefined);
 });

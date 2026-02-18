@@ -1,3 +1,5 @@
+import { normalizeTmuxSocket } from "./socket.js";
+
 export type NotifyMode = "last" | "targets" | "targets+last";
 
 export type NotifyTarget = {
@@ -10,6 +12,7 @@ export type NotifyTarget = {
 
 export type TmuxWatchConfig = {
   enabled: boolean;
+  debug: boolean;
   captureIntervalSeconds?: number;
   pollIntervalMs?: number;
   stableCount?: number;
@@ -30,6 +33,7 @@ export const DEFAULT_STABLE_COUNT = 6;
 
 const DEFAULTS: Omit<TmuxWatchConfig, "captureIntervalSeconds" | "pollIntervalMs" | "stableCount" | "stableSeconds"> = {
   enabled: true,
+  debug: false,
   captureLines: 50,
   stripAnsi: true,
   maxOutputChars: 4000,
@@ -112,6 +116,7 @@ export function resolveTmuxWatchConfig(raw: unknown): TmuxWatchConfig {
 
   return {
     enabled: readBoolean(value.enabled, DEFAULTS.enabled),
+    debug: readBoolean(value.debug, DEFAULTS.debug),
     captureIntervalSeconds: readOptionalNumber(value.captureIntervalSeconds),
     pollIntervalMs: readOptionalNumber(value.pollIntervalMs),
     stableCount: readOptionalNumber(value.stableCount),
@@ -120,7 +125,7 @@ export function resolveTmuxWatchConfig(raw: unknown): TmuxWatchConfig {
     stripAnsi: readBoolean(value.stripAnsi, DEFAULTS.stripAnsi),
     maxOutputChars,
     sessionKey: readString(value.sessionKey) ?? DEFAULTS.sessionKey,
-    socket: readString(value.socket) ?? DEFAULTS.socket,
+    socket: normalizeTmuxSocket(value.socket) ?? DEFAULTS.socket,
     notify: {
       mode: normalizeNotifyMode(notifyRaw.mode, DEFAULTS.notify.mode),
       targets: normalizeTargets(notifyRaw.targets),
