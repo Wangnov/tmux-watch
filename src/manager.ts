@@ -48,6 +48,12 @@ type WatchRuntime = {
   lastCapturedAt?: number;
   lastNotifiedHash?: string;
   lastNotifiedAt?: number;
+  notifyInFlight?: {
+    hash: string;
+    pollId: number;
+    token: string;
+    startedAt: number;
+  };
   lastError?: string;
   timer?: NodeJS.Timeout;
 };
@@ -503,10 +509,11 @@ export class TmuxWatchManager {
     entry.runtime.runningPollId = pollId;
     entry.runtime.runningStartedAt = Date.now();
     const isStale = () => entry.runtime.runningPollId !== pollId;
+    const subscription = { ...entry.subscription };
     try {
-      const output = await this.captureOutput(entry.subscription);
+      const output = await this.captureOutput(subscription);
       if (isStale()) {
-        this.debugSubscription(entry.subscription, "poll abandoned after capture; ownership lost", {
+        this.debugSubscription(subscription, "poll abandoned after capture; ownership lost", {
           pollId,
           currentPollId: entry.runtime.runningPollId,
         });
@@ -514,13 +521,13 @@ export class TmuxWatchManager {
       }
       if (output === null) {
         entry.runtime.lastError = "capture returned null";
-        this.debugSubscription(entry.subscription, "capture returned null; skipping tick", {
+        this.debugSubscription(subscription, "capture returned null; skipping tick", {
           stableTicks: entry.runtime.stableTicks,
         });
         return;
       }
       if (!this.shouldWatchEntry(entry)) {
-        this.debugSubscription(entry.subscription, "poll aborted because entry became unwatchable");
+        this.debugSubscription(subscription, "poll aborted because entry became unwatchable");
         this.stopWatchTimer(entry);
         return;
       }
@@ -536,8 +543,8 @@ export class TmuxWatchManager {
         entry.runtime.stableTicks = 0;
         entry.runtime.lastNotifiedHash = undefined;
       }
-      const stableTicks = resolveStableTicks(entry.subscription, this.config);
-      this.debugSubscription(entry.subscription, "poll captured", {
+      const stableTicks = resolveStableTicks(subscription, this.config);
+      this.debugSubscription(subscription, "poll captured", {
         outputChars: output.length,
         hash: hash.slice(0, 12),
         previousHash: previousHash?.slice(0, 12),
@@ -546,13 +553,65 @@ export class TmuxWatchManager {
       });
       if (entry.runtime.stableTicks >= stableTicks) {
         if (entry.runtime.lastNotifiedHash !== hash) {
-          this.debugSubscription(entry.subscription, "stability reached; notifying", {
-            stableTicks: entry.runtime.stableTicks,
-            stableTicksRequired: stableTicks,
-          });
-          const notified = await this.notifyStable(entry.subscription, output);
           if (isStale()) {
-            this.debugSubscription(entry.subscription, "poll abandoned after notify; ownership lost", {
+            this.debugSubscription(subscription, "poll abandoned before notify; ownership lost", {
+              pollId,
+              currentPollId: entry.runtime.runningPollId,
+            });
+            return;
+          }
+          const now = Date.now();
+          const existingNotifyInFlight = entry.runtime.notifyInFlight;
+          if (
+            existingNotifyInFlight &&
+            existingNotifyInFlight.hash === hash &&
+            existingNotifyInFlight.pollId !== pollId
+          ) {
+            const elapsedMs = now - existingNotifyInFlight.startedAt;
+            if (elapsedMs < POLL_RUNNING_TIMEOUT_MS) {
+              this.debugSubscription(subscription, "notify skipped because same hash is already in-flight", {
+                hash: hash.slice(0, 12),
+                inFlightPollId: existingNotifyInFlight.pollId,
+                elapsedMs,
+              });
+              return;
+            }
+            this.debugSubscription(subscription, "stale notify in-flight marker force-reset after timeout", {
+              hash: hash.slice(0, 12),
+              stalePollId: existingNotifyInFlight.pollId,
+              elapsedMs,
+              timeoutMs: POLL_RUNNING_TIMEOUT_MS,
+            });
+          }
+          const notifyToken = randomUUID();
+          entry.runtime.notifyInFlight = {
+            hash,
+            pollId,
+            token: notifyToken,
+            startedAt: now,
+          };
+          const canSend = () =>
+            !isStale() &&
+            entry.runtime.notifyInFlight?.hash === hash &&
+            entry.runtime.notifyInFlight?.token === notifyToken;
+          let notified = false;
+          try {
+            if (!canSend()) {
+              this.debugSubscription(subscription, "notify aborted before dispatch; ownership lost");
+              return;
+            }
+            this.debugSubscription(subscription, "stability reached; notifying", {
+              stableTicks: entry.runtime.stableTicks,
+              stableTicksRequired: stableTicks,
+            });
+            notified = await this.notifyStable(subscription, output, canSend);
+          } finally {
+            if (entry.runtime.notifyInFlight?.token === notifyToken) {
+              entry.runtime.notifyInFlight = undefined;
+            }
+          }
+          if (isStale()) {
+            this.debugSubscription(subscription, "poll abandoned after notify; ownership lost", {
               pollId,
               currentPollId: entry.runtime.runningPollId,
             });
@@ -562,10 +621,10 @@ export class TmuxWatchManager {
             entry.runtime.lastNotifiedHash = hash;
             entry.runtime.lastNotifiedAt = Date.now();
           } else {
-            this.debugSubscription(entry.subscription, "notify failed; will retry on next stable tick");
+            this.debugSubscription(subscription, "notify failed; will retry on next stable tick");
           }
         } else {
-          this.debugSubscription(entry.subscription, "stability reached but notify skipped", {
+          this.debugSubscription(subscription, "stability reached but notify skipped", {
             reason: "already notified for same hash",
           });
         }
@@ -636,10 +695,15 @@ export class TmuxWatchManager {
   private async notifyStable(
     subscription: TmuxWatchSubscription,
     output: string,
+    canSend: () => boolean,
   ): Promise<boolean> {
     this.debugSubscription(subscription, "notify pipeline started", {
       outputChars: output.length,
     });
+    if (!canSend()) {
+      this.debugSubscription(subscription, "notify aborted before session resolution; poll ownership lost");
+      return false;
+    }
     let sessionKey: string;
     try {
       sessionKey = normalizeSessionKey(
@@ -660,6 +724,10 @@ export class TmuxWatchManager {
       return false;
     }
     const targets = await this.resolveNotifyTargets(subscription, sessionKey);
+    if (!canSend()) {
+      this.debugSubscription(subscription, "notify aborted after target resolution; poll ownership lost");
+      return false;
+    }
     if (targets.length === 0) {
       this.api.logger.warn("[tmux-watch] no notify targets resolved; skipping notify");
       this.debugSubscription(subscription, "notify skipped because no targets resolved", {
@@ -749,6 +817,10 @@ export class TmuxWatchManager {
 
     let dispatchedPrimary = false;
     try {
+      if (!canSend()) {
+        this.debugSubscription(subscription, "dispatch aborted; poll ownership lost");
+        return false;
+      }
       this.debugSubscription(subscription, "dispatching to reply pipeline", {
         primaryChannel: primary.channel,
         primaryTarget: primary.target,
@@ -772,10 +844,21 @@ export class TmuxWatchManager {
             this.debugSubscription(subscription, "dispatcher produced final text", {
               textChars: text.length,
             });
-            if (await this.sendToTarget(primary, text, {
-              subscriptionId: subscription.id,
-              phase: "primary-dispatch",
-            })) {
+            if (!canSend()) {
+              this.debugSubscription(subscription, "deliver aborted; poll ownership lost");
+              return;
+            }
+            if (
+              await this.sendToTarget(
+                primary,
+                text,
+                {
+                  subscriptionId: subscription.id,
+                  phase: "primary-dispatch",
+                },
+                canSend,
+              )
+            ) {
               dispatchedPrimary = true;
             }
           },
@@ -799,20 +882,38 @@ export class TmuxWatchManager {
     }
 
     if (!dispatchedPrimary) {
+      if (!canSend()) {
+        this.debugSubscription(subscription, "fallback aborted; poll ownership lost");
+        return false;
+      }
       this.debugSubscription(subscription, "dispatch produced no primary output; fallback to raw body");
-      dispatchedPrimary = await this.sendToTarget(primary, body, {
-        subscriptionId: subscription.id,
-        phase: "primary-fallback",
-      });
+      dispatchedPrimary = await this.sendToTarget(
+        primary,
+        body,
+        {
+          subscriptionId: subscription.id,
+          phase: "primary-fallback",
+        },
+        canSend,
+      );
     }
 
     if (dispatchedPrimary && targets.length > 1) {
       const mirrorText = body;
       for (const target of targets.slice(1)) {
-        await this.sendToTarget(target, mirrorText, {
-          subscriptionId: subscription.id,
-          phase: "mirror",
-        });
+        if (!canSend()) {
+          this.debugSubscription(subscription, "mirror send aborted; poll ownership lost");
+          break;
+        }
+        await this.sendToTarget(
+          target,
+          mirrorText,
+          {
+            subscriptionId: subscription.id,
+            phase: "mirror",
+          },
+          canSend,
+        );
       }
     }
     this.debugSubscription(subscription, "notify pipeline completed", {
@@ -826,6 +927,7 @@ export class TmuxWatchManager {
     target: ResolvedTarget,
     text: string,
     context?: { subscriptionId?: string; phase?: string },
+    canSend?: () => boolean,
   ): Promise<boolean> {
     const channel = target.channel.trim().toLowerCase();
     if (!channel || !text.trim()) {
@@ -851,8 +953,29 @@ export class TmuxWatchManager {
     });
 
     try {
+      // 最终检查：紧邻发送前，确保 ownership 仍然有效
+      // 这是缩小 TOCTOU 窗口的关键点
+      if (canSend && !canSend()) {
+        this.debugLog("send aborted due to stale notify ownership", {
+          channel: target.channel,
+          target: target.target,
+          subscriptionId: context?.subscriptionId,
+          phase: context?.phase,
+        });
+        return false;
+      }
+
       switch (channel) {
         case "telegram": {
+          // 最终检查紧邻 await，最小化 TOCTOU 窗口
+          if (canSend && !canSend()) {
+            this.debugLog("telegram send aborted at last checkpoint", {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
           await this.api.runtime.channel.telegram.sendMessage(target.target, text, {
             accountId,
             messageThreadId: threadId,
@@ -860,6 +983,14 @@ export class TmuxWatchManager {
           break;
         }
         case "slack": {
+          if (canSend && !canSend()) {
+            this.debugLog("slack send aborted at last checkpoint", {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
           await this.api.runtime.channel.slack.sendMessage(target.target, text, {
             accountId,
             threadTs: threadId != null ? String(threadId) : undefined,
@@ -867,6 +998,14 @@ export class TmuxWatchManager {
           break;
         }
         case "discord": {
+          if (canSend && !canSend()) {
+            this.debugLog("discord send aborted at last checkpoint", {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
           await this.api.runtime.channel.discord.sendMessage(target.target, text, {
             accountId,
             replyTo: threadId != null ? String(threadId) : undefined,
@@ -874,18 +1013,42 @@ export class TmuxWatchManager {
           break;
         }
         case "signal": {
+          if (canSend && !canSend()) {
+            this.debugLog("signal send aborted at last checkpoint", {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
           await this.api.runtime.channel.signal.sendMessage(target.target, text, {
             accountId,
           });
           break;
         }
         case "imessage": {
+          if (canSend && !canSend()) {
+            this.debugLog("imessage send aborted at last checkpoint", {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
           await this.api.runtime.channel.imessage.sendMessage(target.target, text, {
             accountId,
           });
           break;
         }
         case "line": {
+          if (canSend && !canSend()) {
+            this.debugLog("line send aborted at last checkpoint", {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
           await this.api.runtime.channel.line.sendMessage(target.target, text, {
             accountId,
           });
@@ -895,6 +1058,14 @@ export class TmuxWatchManager {
         case "gewe-openclaw":
         case "web":
         case "webchat": {
+          if (canSend && !canSend()) {
+            this.debugLog(`${channel} send aborted at last checkpoint`, {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
           await this.api.runtime.channel.whatsapp.sendMessage(target.target, text, {
             accountId,
           });
