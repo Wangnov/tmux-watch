@@ -40,7 +40,8 @@ type PersistedState = {
 };
 
 type WatchRuntime = {
-  running: boolean;
+  runningPollId?: number;
+  runningStartedAt?: number;
   stableTicks: number;
   lastHash?: string;
   lastOutput?: string;
@@ -90,6 +91,7 @@ const STATE_VERSION = 1;
 const INTERNAL_LAST_CHANNELS = new Set(["webchat", "tui"]);
 const TMUX_RECHECK_INTERVAL_MS = 5000;
 const STATE_SYNC_INTERVAL_MS = 1000;
+const POLL_RUNNING_TIMEOUT_MS = 120_000;
 
 export class TmuxWatchManager {
   private readonly api: OpenClawPluginApi;
@@ -103,6 +105,7 @@ export class TmuxWatchManager {
   private stateMtimeMs = 0;
   private stateSyncPromise: Promise<void> | null = null;
   private stateSyncTimer: NodeJS.Timeout | null = null;
+  private pollIdCounter = 0;
 
   constructor(api: OpenClawPluginApi) {
     this.api = api;
@@ -476,13 +479,39 @@ export class TmuxWatchManager {
       this.stopWatchTimer(entry);
       return;
     }
-    if (entry.runtime.running) {
-      this.debugSubscription(entry.subscription, "poll skipped because previous tick still running");
-      return;
+    if (entry.runtime.runningPollId != null) {
+      const elapsed = entry.runtime.runningStartedAt
+        ? Date.now() - entry.runtime.runningStartedAt
+        : 0;
+      if (elapsed < POLL_RUNNING_TIMEOUT_MS) {
+        this.debugSubscription(entry.subscription, "poll skipped because previous tick still running", {
+          pollId: entry.runtime.runningPollId,
+          elapsedMs: elapsed,
+        });
+        return;
+      }
+      this.api.logger.warn("[tmux-watch] previous poll timed out; force-resetting running flag");
+      this.debugSubscription(entry.subscription, "running flag force-reset after timeout", {
+        stalePollId: entry.runtime.runningPollId,
+        elapsedMs: elapsed,
+        timeoutMs: POLL_RUNNING_TIMEOUT_MS,
+      });
+      entry.runtime.runningPollId = undefined;
+      entry.runtime.runningStartedAt = undefined;
     }
-    entry.runtime.running = true;
+    const pollId = ++this.pollIdCounter;
+    entry.runtime.runningPollId = pollId;
+    entry.runtime.runningStartedAt = Date.now();
+    const isStale = () => entry.runtime.runningPollId !== pollId;
     try {
       const output = await this.captureOutput(entry.subscription);
+      if (isStale()) {
+        this.debugSubscription(entry.subscription, "poll abandoned after capture; ownership lost", {
+          pollId,
+          currentPollId: entry.runtime.runningPollId,
+        });
+        return;
+      }
       if (output === null) {
         entry.runtime.lastError = "capture returned null";
         this.debugSubscription(entry.subscription, "capture returned null; skipping tick", {
@@ -522,6 +551,13 @@ export class TmuxWatchManager {
             stableTicksRequired: stableTicks,
           });
           const notified = await this.notifyStable(entry.subscription, output);
+          if (isStale()) {
+            this.debugSubscription(entry.subscription, "poll abandoned after notify; ownership lost", {
+              pollId,
+              currentPollId: entry.runtime.runningPollId,
+            });
+            return;
+          }
           if (notified) {
             entry.runtime.lastNotifiedHash = hash;
             entry.runtime.lastNotifiedAt = Date.now();
@@ -535,7 +571,10 @@ export class TmuxWatchManager {
         }
       }
     } finally {
-      entry.runtime.running = false;
+      if (entry.runtime.runningPollId === pollId) {
+        entry.runtime.runningPollId = undefined;
+        entry.runtime.runningStartedAt = undefined;
+      }
     }
   }
 
@@ -1027,7 +1066,6 @@ export function createTmuxWatchManager(api: OpenClawPluginApi) {
 
 function createRuntime(): WatchRuntime {
   return {
-    running: false,
     stableTicks: 0,
   };
 }
