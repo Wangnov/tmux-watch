@@ -515,13 +515,17 @@ export class TmuxWatchManager {
       });
       if (entry.runtime.stableTicks >= stableTicks) {
         if (entry.runtime.lastNotifiedHash !== hash) {
-          entry.runtime.lastNotifiedHash = hash;
-          entry.runtime.lastNotifiedAt = Date.now();
           this.debugSubscription(entry.subscription, "stability reached; notifying", {
             stableTicks: entry.runtime.stableTicks,
             stableTicksRequired: stableTicks,
           });
-          await this.notifyStable(entry.subscription, output);
+          const notified = await this.notifyStable(entry.subscription, output);
+          if (notified) {
+            entry.runtime.lastNotifiedHash = hash;
+            entry.runtime.lastNotifiedAt = Date.now();
+          } else {
+            this.debugSubscription(entry.subscription, "notify failed; will retry on next stable tick");
+          }
         } else {
           this.debugSubscription(entry.subscription, "stability reached but notify skipped", {
             reason: "already notified for same hash",
@@ -591,7 +595,7 @@ export class TmuxWatchManager {
   private async notifyStable(
     subscription: TmuxWatchSubscription,
     output: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     this.debugSubscription(subscription, "notify pipeline started", {
       outputChars: output.length,
     });
@@ -602,7 +606,7 @@ export class TmuxWatchManager {
     if (!sessionKey) {
       this.api.logger.warn("[tmux-watch] missing sessionKey; skipping notify");
       this.debugSubscription(subscription, "notify skipped because sessionKey missing");
-      return;
+      return false;
     }
     const targets = await this.resolveNotifyTargets(subscription, sessionKey);
     if (targets.length === 0) {
@@ -610,7 +614,7 @@ export class TmuxWatchManager {
       this.debugSubscription(subscription, "notify skipped because no targets resolved", {
         sessionKey,
       });
-      return;
+      return false;
     }
     this.debugSubscription(subscription, "notify targets resolved", {
       sessionKey,
@@ -717,11 +721,12 @@ export class TmuxWatchManager {
             this.debugSubscription(subscription, "dispatcher produced final text", {
               textChars: text.length,
             });
-            await this.sendToTarget(primary, text, {
+            if (await this.sendToTarget(primary, text, {
               subscriptionId: subscription.id,
               phase: "primary-dispatch",
-            });
-            dispatchedPrimary = true;
+            })) {
+              dispatchedPrimary = true;
+            }
           },
           onError: (err: unknown) => {
             this.api.logger.warn(
@@ -744,13 +749,13 @@ export class TmuxWatchManager {
 
     if (!dispatchedPrimary) {
       this.debugSubscription(subscription, "dispatch produced no primary output; fallback to raw body");
-      await this.sendToTarget(primary, body, {
+      dispatchedPrimary = await this.sendToTarget(primary, body, {
         subscriptionId: subscription.id,
         phase: "primary-fallback",
       });
     }
 
-    if (targets.length > 1) {
+    if (dispatchedPrimary && targets.length > 1) {
       const mirrorText = body;
       for (const target of targets.slice(1)) {
         await this.sendToTarget(target, mirrorText, {
@@ -761,15 +766,16 @@ export class TmuxWatchManager {
     }
     this.debugSubscription(subscription, "notify pipeline completed", {
       dispatchedPrimary,
-      mirroredCount: Math.max(0, targets.length - 1),
+      mirroredCount: dispatchedPrimary ? Math.max(0, targets.length - 1) : 0,
     });
+    return dispatchedPrimary;
   }
 
   private async sendToTarget(
     target: ResolvedTarget,
     text: string,
     context?: { subscriptionId?: string; phase?: string },
-  ): Promise<void> {
+  ): Promise<boolean> {
     const channel = target.channel.trim().toLowerCase();
     if (!channel || !text.trim()) {
       this.debugLog("send skipped due to empty channel or text", {
@@ -778,7 +784,7 @@ export class TmuxWatchManager {
         subscriptionId: context?.subscriptionId,
         phase: context?.phase,
       });
-      return;
+      return false;
     }
     const accountId = target.accountId?.trim() || undefined;
     const threadId = parseThreadId(target.threadId);
@@ -800,75 +806,39 @@ export class TmuxWatchManager {
             accountId,
             messageThreadId: threadId,
           });
-          this.debugLog("send success", {
-            channel,
-            target: target.target,
-            subscriptionId: context?.subscriptionId,
-            phase: context?.phase,
-          });
-          return;
+          break;
         }
         case "slack": {
           await this.api.runtime.channel.slack.sendMessage(target.target, text, {
             accountId,
             threadTs: threadId != null ? String(threadId) : undefined,
           });
-          this.debugLog("send success", {
-            channel,
-            target: target.target,
-            subscriptionId: context?.subscriptionId,
-            phase: context?.phase,
-          });
-          return;
+          break;
         }
         case "discord": {
           await this.api.runtime.channel.discord.sendMessage(target.target, text, {
             accountId,
             replyTo: threadId != null ? String(threadId) : undefined,
           });
-          this.debugLog("send success", {
-            channel,
-            target: target.target,
-            subscriptionId: context?.subscriptionId,
-            phase: context?.phase,
-          });
-          return;
+          break;
         }
         case "signal": {
           await this.api.runtime.channel.signal.sendMessage(target.target, text, {
             accountId,
           });
-          this.debugLog("send success", {
-            channel,
-            target: target.target,
-            subscriptionId: context?.subscriptionId,
-            phase: context?.phase,
-          });
-          return;
+          break;
         }
         case "imessage": {
           await this.api.runtime.channel.imessage.sendMessage(target.target, text, {
             accountId,
           });
-          this.debugLog("send success", {
-            channel,
-            target: target.target,
-            subscriptionId: context?.subscriptionId,
-            phase: context?.phase,
-          });
-          return;
+          break;
         }
         case "line": {
           await this.api.runtime.channel.line.sendMessage(target.target, text, {
             accountId,
           });
-          this.debugLog("send success", {
-            channel,
-            target: target.target,
-            subscriptionId: context?.subscriptionId,
-            phase: context?.phase,
-          });
-          return;
+          break;
         }
         case "whatsapp":
         case "gewe-openclaw":
@@ -877,13 +847,7 @@ export class TmuxWatchManager {
           await this.api.runtime.channel.whatsapp.sendMessage(target.target, text, {
             accountId,
           });
-          this.debugLog("send success", {
-            channel,
-            target: target.target,
-            subscriptionId: context?.subscriptionId,
-            phase: context?.phase,
-          });
-          return;
+          break;
         }
         default: {
           this.api.logger.warn(`[tmux-watch] unsupported notify channel: ${target.channel}`);
@@ -893,9 +857,16 @@ export class TmuxWatchManager {
             subscriptionId: context?.subscriptionId,
             phase: context?.phase,
           });
-          return;
+          return false;
         }
       }
+      this.debugLog("send success", {
+        channel,
+        target: target.target,
+        subscriptionId: context?.subscriptionId,
+        phase: context?.phase,
+      });
+      return true;
     } catch (err) {
       this.api.logger.warn(
         `[tmux-watch] send failed (${target.channel}:${target.target}): ${
@@ -909,6 +880,7 @@ export class TmuxWatchManager {
         subscriptionId: context?.subscriptionId,
         phase: context?.phase,
       });
+      return false;
     }
   }
 
