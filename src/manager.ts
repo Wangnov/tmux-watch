@@ -484,8 +484,10 @@ export class TmuxWatchManager {
     try {
       const output = await this.captureOutput(entry.subscription);
       if (output === null) {
-        entry.runtime.stableTicks = 0;
-        this.debugSubscription(entry.subscription, "capture returned null; stableTicks reset");
+        entry.runtime.lastError = "capture returned null";
+        this.debugSubscription(entry.subscription, "capture returned null; skipping tick", {
+          stableTicks: entry.runtime.stableTicks,
+        });
         return;
       }
       if (!this.shouldWatchEntry(entry)) {
