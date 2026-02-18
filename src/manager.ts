@@ -599,10 +599,20 @@ export class TmuxWatchManager {
     this.debugSubscription(subscription, "notify pipeline started", {
       outputChars: output.length,
     });
-    const sessionKey = normalizeSessionKey(
-      subscription.sessionKey ?? this.config.sessionKey,
-      this.api.config,
-    );
+    let sessionKey: string;
+    try {
+      sessionKey = normalizeSessionKey(
+        subscription.sessionKey ?? this.config.sessionKey,
+        this.api.config,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.api.logger.warn(`[tmux-watch] invalid sessionKey: ${message}`);
+      this.debugSubscription(subscription, "notify skipped because sessionKey invalid", {
+        error: message,
+      });
+      return false;
+    }
     if (!sessionKey) {
       this.api.logger.warn("[tmux-watch] missing sessionKey; skipping notify");
       this.debugSubscription(subscription, "notify skipped because sessionKey missing");
@@ -1222,7 +1232,13 @@ function normalizeSessionKey(input: string | undefined, cfg?: MinimalConfig) {
     return "global";
   }
   const lowered = trimmed.toLowerCase();
-  if (lowered.startsWith("agent:") || lowered.startsWith("subagent:") || lowered === "global") {
+  if (lowered.startsWith("subagent:")) {
+    throw new Error(
+      `Invalid sessionKey "${trimmed}": subagent:* format is not supported. ` +
+        `Use agent:<id>:<key> or omit sessionKey to use the default.`,
+    );
+  }
+  if (lowered.startsWith("agent:") || lowered === "global") {
     return lowered;
   }
   const defaultKey = resolveDefaultSessionKey(cfg);
