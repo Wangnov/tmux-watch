@@ -87,6 +87,7 @@ type MinimalConfig = {
 
 const STATE_VERSION = 1;
 const INTERNAL_LAST_CHANNELS = new Set(["webchat", "tui"]);
+const TEMP_FILE_SUFFIX = ".tmp";
 
 export class TmuxWatchManager {
   private readonly api: OpenClawPluginApi;
@@ -226,12 +227,23 @@ export class TmuxWatchManager {
     const filePath = this.getStatePath();
     try {
       const raw = await fs.readFile(filePath, "utf8");
-      const parsed = JSON.parse(raw) as PersistedState;
-      if (!parsed || parsed.version !== STATE_VERSION || !Array.isArray(parsed.subscriptions)) {
+      const parsed = parsePersistedState(raw);
+      if (parsed) {
+        return parsed;
+      }
+      await this.quarantineInvalidState(filePath, "invalid persisted state shape");
+      return { version: STATE_VERSION, subscriptions: [] };
+    } catch (err) {
+      const code = err && typeof err === "object" && "code" in err ? String(err.code) : "";
+      if (code === "ENOENT") {
         return { version: STATE_VERSION, subscriptions: [] };
       }
-      return parsed;
-    } catch {
+      const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof SyntaxError) {
+        await this.quarantineInvalidState(filePath, message);
+        return { version: STATE_VERSION, subscriptions: [] };
+      }
+      this.api.logger.warn(`[tmux-watch] failed to read persisted state ${filePath}: ${message}`);
       return { version: STATE_VERSION, subscriptions: [] };
     }
   }
@@ -244,7 +256,22 @@ export class TmuxWatchManager {
       version: STATE_VERSION,
       subscriptions: Array.from(this.entries.values()).map((entry) => entry.subscription),
     };
-    await fs.writeFile(filePath, JSON.stringify(payload, null, 2));
+    await writeTextAtomic(filePath, JSON.stringify(payload, null, 2));
+  }
+
+  private async quarantineInvalidState(filePath: string, reason: string): Promise<void> {
+    const backupPath = `${filePath}.corrupt-${Date.now()}-${randomUUID()}`;
+    try {
+      await fs.rename(filePath, backupPath);
+      this.api.logger.warn(
+        `[tmux-watch] invalid persisted state moved aside: ${filePath} -> ${backupPath} (${reason})`,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.api.logger.warn(
+        `[tmux-watch] invalid persisted state at ${filePath} (${reason}); backup failed: ${message}`,
+      );
+    }
   }
 
   private startWatch(entry: WatchEntry): void {
@@ -537,6 +564,25 @@ function createRuntime(): WatchRuntime {
     running: false,
     stableTicks: 0,
   };
+}
+
+function parsePersistedState(raw: string): PersistedState | null {
+  const parsed = JSON.parse(raw) as PersistedState;
+  if (!parsed || parsed.version !== STATE_VERSION || !Array.isArray(parsed.subscriptions)) {
+    return null;
+  }
+  return parsed;
+}
+
+async function writeTextAtomic(filePath: string, content: string): Promise<void> {
+  const tempPath = `${filePath}.${randomUUID()}${TEMP_FILE_SUFFIX}`;
+  try {
+    await fs.writeFile(tempPath, content, "utf8");
+    await fs.rename(tempPath, filePath);
+  } catch (err) {
+    await fs.unlink(tempPath).catch(() => undefined);
+    throw err;
+  }
 }
 
 export function resolveIntervalMs(
