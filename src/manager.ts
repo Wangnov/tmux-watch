@@ -3,10 +3,9 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { captureTmux, type CaptureParams, type CaptureResult } from "./capture.js";
+import { normalizeTimingOverride, toIntervalMs } from "./compat.js";
 import { stripAnsi, truncateOutput } from "./text-utils.js";
 import {
-  DEFAULT_CAPTURE_INTERVAL_SECONDS,
-  DEFAULT_STABLE_COUNT,
   resolveTmuxWatchConfig,
   type NotifyMode,
   type NotifyTarget,
@@ -24,6 +23,9 @@ export type TmuxWatchSubscription = {
   intervalMs?: number;
   stableCount?: number;
   stableSeconds?: number;
+  cooldownSeconds?: number;
+  minOutputChars?: number;
+  ignoreWhitespaceOnlyChanges?: boolean;
   captureLines?: number;
   stripAnsi?: boolean;
   enabled?: boolean;
@@ -171,7 +173,7 @@ export class TmuxWatchManager {
     const existing = this.entries.get(id);
     const subscription: TmuxWatchSubscription = {
       ...(existing?.subscription ?? {}),
-      ...sanitizeSubscriptionInput(input),
+      ...sanitizeSubscriptionInput(input, this.config),
       id,
     };
     const runtime = existing?.runtime ?? createRuntime();
@@ -211,7 +213,7 @@ export class TmuxWatchManager {
         continue;
       }
       this.entries.set(subscription.id, {
-        subscription,
+        subscription: normalizeStoredSubscription(subscription, this.config),
         runtime: createRuntime(),
       });
     }
@@ -303,7 +305,11 @@ export class TmuxWatchManager {
       }
       entry.runtime.lastCapturedAt = Date.now();
       entry.runtime.lastError = undefined;
-      const hash = hashOutput(output);
+      const comparableOutput = normalizeComparableOutput(
+        output,
+        resolveIgnoreWhitespaceOnlyChanges(entry.subscription, this.config),
+      );
+      const hash = hashOutput(comparableOutput);
       if (entry.runtime.lastHash && entry.runtime.lastHash === hash) {
         entry.runtime.stableTicks += 1;
       } else {
@@ -315,9 +321,11 @@ export class TmuxWatchManager {
       const stableTicks = resolveStableTicks(entry.subscription, this.config);
       if (entry.runtime.stableTicks >= stableTicks) {
         if (entry.runtime.lastNotifiedHash !== hash) {
-          entry.runtime.lastNotifiedHash = hash;
-          entry.runtime.lastNotifiedAt = Date.now();
-          await this.notifyStable(entry.subscription, output);
+          if (shouldNotifyForStableOutput(entry.runtime, entry.subscription, this.config, output)) {
+            entry.runtime.lastNotifiedHash = hash;
+            entry.runtime.lastNotifiedAt = Date.now();
+            await this.notifyStable(entry.subscription, output);
+          }
         }
       }
     } finally {
@@ -593,19 +601,8 @@ export function resolveIntervalMs(
     typeof subscription.captureIntervalSeconds === "number" &&
     Number.isFinite(subscription.captureIntervalSeconds)
       ? subscription.captureIntervalSeconds
-      : typeof cfg.captureIntervalSeconds === "number" && Number.isFinite(cfg.captureIntervalSeconds)
-        ? cfg.captureIntervalSeconds
-        : undefined;
-  if (typeof captureIntervalSeconds === "number") {
-    return Math.max(200, Math.trunc(captureIntervalSeconds * 1000));
-  }
-  const raw =
-    typeof subscription.intervalMs === "number" && Number.isFinite(subscription.intervalMs)
-      ? subscription.intervalMs
-      : typeof cfg.pollIntervalMs === "number" && Number.isFinite(cfg.pollIntervalMs)
-        ? cfg.pollIntervalMs
-        : DEFAULT_CAPTURE_INTERVAL_SECONDS * 1000;
-  return Math.max(200, Math.trunc(raw));
+      : cfg.captureIntervalSeconds;
+  return toIntervalMs(captureIntervalSeconds);
 }
 
 export function resolveStableCount(
@@ -615,23 +612,8 @@ export function resolveStableCount(
   const rawCount =
     typeof subscription.stableCount === "number" && Number.isFinite(subscription.stableCount)
       ? subscription.stableCount
-      : typeof cfg.stableCount === "number" && Number.isFinite(cfg.stableCount)
-        ? cfg.stableCount
-        : undefined;
-  if (typeof rawCount === "number") {
-    return Math.max(1, Math.trunc(rawCount));
-  }
-  const stableSeconds =
-    typeof subscription.stableSeconds === "number" && Number.isFinite(subscription.stableSeconds)
-      ? subscription.stableSeconds
-      : typeof cfg.stableSeconds === "number" && Number.isFinite(cfg.stableSeconds)
-        ? cfg.stableSeconds
-        : undefined;
-  if (typeof stableSeconds === "number") {
-    const intervalMs = resolveIntervalMs(subscription, cfg);
-    return Math.max(1, Math.ceil((stableSeconds * 1000) / intervalMs));
-  }
-  return DEFAULT_STABLE_COUNT;
+      : cfg.stableCount;
+  return Math.max(1, Math.trunc(rawCount));
 }
 
 function resolveStableTicks(subscription: TmuxWatchSubscription, cfg: TmuxWatchConfig): number {
@@ -653,6 +635,60 @@ function resolveCaptureLines(subscription: TmuxWatchSubscription, cfg: TmuxWatch
       ? subscription.captureLines
       : cfg.captureLines;
   return Math.max(10, Math.trunc(raw));
+}
+
+function resolveCooldownMs(subscription: TmuxWatchSubscription, cfg: TmuxWatchConfig): number {
+  const raw =
+    typeof subscription.cooldownSeconds === "number" && Number.isFinite(subscription.cooldownSeconds)
+      ? subscription.cooldownSeconds
+      : cfg.cooldownSeconds;
+  return Math.max(0, Math.trunc(raw * 1000));
+}
+
+function resolveMinOutputChars(subscription: TmuxWatchSubscription, cfg: TmuxWatchConfig): number {
+  const raw =
+    typeof subscription.minOutputChars === "number" && Number.isFinite(subscription.minOutputChars)
+      ? subscription.minOutputChars
+      : cfg.minOutputChars;
+  return Math.max(0, Math.trunc(raw));
+}
+
+function resolveIgnoreWhitespaceOnlyChanges(
+  subscription: TmuxWatchSubscription,
+  cfg: TmuxWatchConfig,
+): boolean {
+  return typeof subscription.ignoreWhitespaceOnlyChanges === "boolean"
+    ? subscription.ignoreWhitespaceOnlyChanges
+    : cfg.ignoreWhitespaceOnlyChanges;
+}
+
+export function normalizeComparableOutput(
+  output: string,
+  ignoreWhitespaceOnlyChanges: boolean,
+): string {
+  if (!ignoreWhitespaceOnlyChanges) {
+    return output;
+  }
+  return output.replace(/\s+/g, " ").trim();
+}
+
+function shouldNotifyForStableOutput(
+  runtime: WatchRuntime,
+  subscription: TmuxWatchSubscription,
+  cfg: TmuxWatchConfig,
+  output: string,
+): boolean {
+  if (output.length < resolveMinOutputChars(subscription, cfg)) {
+    return false;
+  }
+  const cooldownMs = resolveCooldownMs(subscription, cfg);
+  if (cooldownMs <= 0) {
+    return true;
+  }
+  if (!runtime.lastNotifiedAt) {
+    return true;
+  }
+  return Date.now() - runtime.lastNotifiedAt >= cooldownMs;
 }
 
 function resolveStripAnsi(subscription: TmuxWatchSubscription, cfg: TmuxWatchConfig): boolean {
@@ -699,10 +735,12 @@ function sanitizeTargets(targets: NotifyTarget[]): NotifyTarget[] {
 
 function sanitizeSubscriptionInput(
   input: Partial<TmuxWatchSubscription> & { target: string },
+  cfg: TmuxWatchConfig,
 ): TmuxWatchSubscription {
   const notifyTargets = Array.isArray(input.notify?.targets)
     ? sanitizeTargets(input.notify?.targets)
     : undefined;
+  const timing = normalizeTimingOverride(input, cfg);
   return {
     id: input.id?.trim() ?? "",
     label: typeof input.label === "string" ? input.label.trim() : undefined,
@@ -710,13 +748,49 @@ function sanitizeSubscriptionInput(
     target: input.target.trim(),
     socket: typeof input.socket === "string" ? input.socket.trim() : undefined,
     sessionKey: typeof input.sessionKey === "string" ? input.sessionKey.trim() : undefined,
-    captureIntervalSeconds: input.captureIntervalSeconds,
-    intervalMs: input.intervalMs,
-    stableCount: input.stableCount,
-    stableSeconds: input.stableSeconds,
+    captureIntervalSeconds: timing.captureIntervalSeconds,
+    intervalMs: undefined,
+    stableCount: timing.stableCount,
+    stableSeconds: undefined,
+    cooldownSeconds: input.cooldownSeconds,
+    minOutputChars: input.minOutputChars,
+    ignoreWhitespaceOnlyChanges: input.ignoreWhitespaceOnlyChanges,
     captureLines: input.captureLines,
     stripAnsi: input.stripAnsi,
     enabled: input.enabled,
+    notify:
+      input.notify?.mode || notifyTargets
+        ? {
+            mode: input.notify?.mode,
+            targets: notifyTargets,
+          }
+        : undefined,
+  };
+}
+
+function normalizeStoredSubscription(
+  input: TmuxWatchSubscription,
+  cfg: TmuxWatchConfig,
+): TmuxWatchSubscription {
+  const timing = normalizeTimingOverride(input, cfg);
+  const notifyTargets = Array.isArray(input.notify?.targets)
+    ? sanitizeTargets(input.notify.targets)
+    : undefined;
+  return {
+    ...input,
+    id: input.id.trim(),
+    label: typeof input.label === "string" ? input.label.trim() : undefined,
+    note: typeof input.note === "string" ? input.note.trim() : undefined,
+    target: input.target.trim(),
+    socket: typeof input.socket === "string" ? input.socket.trim() : undefined,
+    sessionKey: typeof input.sessionKey === "string" ? input.sessionKey.trim() : undefined,
+    captureIntervalSeconds: timing.captureIntervalSeconds,
+    intervalMs: undefined,
+    stableCount: timing.stableCount,
+    stableSeconds: undefined,
+    cooldownSeconds: input.cooldownSeconds,
+    minOutputChars: input.minOutputChars,
+    ignoreWhitespaceOnlyChanges: input.ignoreWhitespaceOnlyChanges,
     notify:
       input.notify?.mode || notifyTargets
         ? {

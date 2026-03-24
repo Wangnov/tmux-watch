@@ -1,3 +1,9 @@
+import {
+  DEFAULT_CAPTURE_INTERVAL_SECONDS,
+  DEFAULT_STABLE_COUNT,
+  normalizeTimingCompat,
+} from "./compat.js";
+
 export type NotifyMode = "last" | "targets" | "targets+last";
 
 export type NotifyTarget = {
@@ -10,10 +16,11 @@ export type NotifyTarget = {
 
 export type TmuxWatchConfig = {
   enabled: boolean;
-  captureIntervalSeconds?: number;
-  pollIntervalMs?: number;
-  stableCount?: number;
-  stableSeconds?: number;
+  captureIntervalSeconds: number;
+  stableCount: number;
+  cooldownSeconds: number;
+  minOutputChars: number;
+  ignoreWhitespaceOnlyChanges: boolean;
   captureLines: number;
   stripAnsi: boolean;
   maxOutputChars: number;
@@ -25,11 +32,15 @@ export type TmuxWatchConfig = {
   };
 };
 
-export const DEFAULT_CAPTURE_INTERVAL_SECONDS = 10;
-export const DEFAULT_STABLE_COUNT = 6;
+export const DEFAULT_COOLDOWN_SECONDS = 120;
+export const DEFAULT_MIN_OUTPUT_CHARS = 8;
+export const DEFAULT_IGNORE_WHITESPACE_ONLY_CHANGES = true;
 
-const DEFAULTS: Omit<TmuxWatchConfig, "captureIntervalSeconds" | "pollIntervalMs" | "stableCount" | "stableSeconds"> = {
+const DEFAULTS: Omit<TmuxWatchConfig, "captureIntervalSeconds" | "stableCount"> = {
   enabled: true,
+  cooldownSeconds: DEFAULT_COOLDOWN_SECONDS,
+  minOutputChars: DEFAULT_MIN_OUTPUT_CHARS,
+  ignoreWhitespaceOnlyChanges: DEFAULT_IGNORE_WHITESPACE_ONLY_CHANGES,
   captureLines: 50,
   stripAnsi: true,
   maxOutputChars: 4000,
@@ -50,13 +61,6 @@ function readNumber(raw: unknown, fallback: number): number {
     return raw;
   }
   return fallback;
-}
-
-function readOptionalNumber(raw: unknown): number | undefined {
-  if (typeof raw === "number" && Number.isFinite(raw)) {
-    return raw;
-  }
-  return undefined;
 }
 
 function readBoolean(raw: unknown, fallback: boolean): boolean {
@@ -106,16 +110,21 @@ function normalizeTargets(raw: unknown): NotifyTarget[] {
 export function resolveTmuxWatchConfig(raw: unknown): TmuxWatchConfig {
   const value = isRecord(raw) ? raw : {};
   const notifyRaw = isRecord(value.notify) ? value.notify : {};
+  const timing = normalizeTimingCompat(value);
 
   const captureLines = Math.max(10, readNumber(value.captureLines, DEFAULTS.captureLines));
   const maxOutputChars = Math.max(200, readNumber(value.maxOutputChars, DEFAULTS.maxOutputChars));
 
   return {
     enabled: readBoolean(value.enabled, DEFAULTS.enabled),
-    captureIntervalSeconds: readOptionalNumber(value.captureIntervalSeconds),
-    pollIntervalMs: readOptionalNumber(value.pollIntervalMs),
-    stableCount: readOptionalNumber(value.stableCount),
-    stableSeconds: readOptionalNumber(value.stableSeconds),
+    captureIntervalSeconds: timing.captureIntervalSeconds,
+    stableCount: timing.stableCount,
+    cooldownSeconds: Math.max(0, readNumber(value.cooldownSeconds, DEFAULTS.cooldownSeconds)),
+    minOutputChars: Math.max(0, readNumber(value.minOutputChars, DEFAULTS.minOutputChars)),
+    ignoreWhitespaceOnlyChanges: readBoolean(
+      value.ignoreWhitespaceOnlyChanges,
+      DEFAULTS.ignoreWhitespaceOnlyChanges,
+    ),
     captureLines,
     stripAnsi: readBoolean(value.stripAnsi, DEFAULTS.stripAnsi),
     maxOutputChars,
@@ -127,3 +136,5 @@ export function resolveTmuxWatchConfig(raw: unknown): TmuxWatchConfig {
     },
   };
 }
+
+export { DEFAULT_CAPTURE_INTERVAL_SECONDS, DEFAULT_STABLE_COUNT };

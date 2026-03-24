@@ -16,6 +16,14 @@ type PluginsConfig = {
   entries?: Record<string, { enabled?: boolean; config?: Record<string, unknown> }>;
 };
 
+export type TmuxPaneChoice = {
+  target: string;
+  sessionName: string;
+  windowName?: string;
+  paneTitle?: string;
+  currentCommand?: string;
+};
+
 function extractSocket(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) {
@@ -93,6 +101,127 @@ function normalizeNumber(raw: unknown): number | undefined {
   return undefined;
 }
 
+export function parseTmuxPaneList(raw: string): TmuxPaneChoice[] {
+  const panes: TmuxPaneChoice[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const [target, sessionName, windowName, paneTitle, currentCommand] = trimmed.split("\t");
+    if (!target || !sessionName) {
+      continue;
+    }
+    panes.push({
+      target,
+      sessionName,
+      windowName: windowName || undefined,
+      paneTitle: paneTitle || undefined,
+      currentCommand: currentCommand || undefined,
+    });
+  }
+  return panes;
+}
+
+function describePane(pane: TmuxPaneChoice): string {
+  const details = [pane.windowName, pane.paneTitle, pane.currentCommand]
+    .filter((value): value is string => Boolean(value))
+    .join(" / ");
+  return details ? `${pane.target} (${details})` : pane.target;
+}
+
+async function listTmuxPanes(
+  api: OpenClawPluginApi,
+  socket: string | undefined,
+): Promise<TmuxPaneChoice[]> {
+  const argv = socket
+    ? ["tmux", "-S", socket, "list-panes", "-a", "-F", "#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_name}\t#{pane_title}\t#{pane_current_command}"]
+    : ["tmux", "list-panes", "-a", "-F", "#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_name}\t#{pane_title}\t#{pane_current_command}"];
+  const result = await api.runtime.system.runCommandWithTimeout(argv, {
+    timeoutMs: 5000,
+  });
+  if (result.code !== 0) {
+    const err = (result.stderr ?? result.stdout ?? "").trim();
+    throw new Error(err ? `tmux list-panes failed: ${err}` : "tmux list-panes failed");
+  }
+  return parseTmuxPaneList(result.stdout ?? "");
+}
+
+async function promptText(question: string): Promise<string | undefined> {
+  if (!process.stdin.isTTY) {
+    return undefined;
+  }
+  const rl = readline.createInterface({ input, output });
+  try {
+    const answer = await rl.question(question);
+    const trimmed = answer.trim();
+    return trimmed || undefined;
+  } finally {
+    rl.close();
+  }
+}
+
+async function promptPaneSelection(logger: Logger, panes: TmuxPaneChoice[]): Promise<TmuxPaneChoice> {
+  if (!process.stdin.isTTY) {
+    throw new Error("No TTY available for pane selection. Use --target <pane>.");
+  }
+  logger.info("Available tmux panes:");
+  panes.forEach((pane, index) => {
+    logger.info(`  ${index + 1}) ${describePane(pane)}`);
+  });
+  const answer = await promptText("Choose pane number: ");
+  const selectedIndex = answer ? Number(answer) : Number.NaN;
+  if (!Number.isFinite(selectedIndex) || selectedIndex < 1 || selectedIndex > panes.length) {
+    throw new Error("Invalid pane selection.");
+  }
+  return panes[selectedIndex - 1]!;
+}
+
+export async function setupTmuxWatch(params: {
+  api: OpenClawPluginApi;
+  logger: Logger;
+  socket: string;
+  target: string;
+  label?: string;
+  note?: string;
+}) {
+  const { api, socket, target, label, note } = params;
+  const cfg = api.runtime.config.loadConfig();
+  const plugins = (cfg.plugins ?? {}) as PluginsConfig;
+  const entries = { ...(plugins.entries ?? {}) };
+  const entry = { ...(entries["tmux-watch"] ?? {}) };
+  const entryConfig = { ...(entry.config ?? {}) };
+
+  entry.enabled = true;
+  entry.config = {
+    ...entryConfig,
+    socket,
+  };
+
+  entries["tmux-watch"] = entry;
+
+  await api.runtime.config.writeConfigFile({
+    ...cfg,
+    plugins: {
+      ...plugins,
+      entries,
+    },
+  });
+
+  const manager = createTmuxWatchManager(api);
+  const subscription = await manager.addSubscription({
+    target,
+    label,
+    note,
+    socket,
+  });
+
+  return {
+    socket,
+    subscription,
+  };
+}
+
 export function registerTmuxWatchCli(params: {
   program: Command;
   api: OpenClawPluginApi;
@@ -107,9 +236,12 @@ export function registerTmuxWatchCli(params: {
 
   root
     .command("setup")
-    .description("Configure tmux-watch (socket is required)")
+    .description("Configure tmux-watch and optionally create a subscription")
     .option("--socket <path>", "tmux socket path (or full $TMUX value)")
-    .action(async (options: { socket?: string }) => {
+    .option("--target <target>", "tmux target to subscribe immediately")
+    .option("--label <label>", "subscription label")
+    .option("--note <note>", "subscription note")
+    .action(async (options: { socket?: string; target?: string; label?: string; note?: string }) => {
       let socket = options.socket ? extractSocket(options.socket) : undefined;
       if (!socket) {
         socket = resolveSocketFromEnv();
@@ -121,29 +253,65 @@ export function registerTmuxWatchCli(params: {
         throw new Error("Socket required. Re-run with --socket or provide it interactively.");
       }
 
-      const cfg = api.runtime.config.loadConfig();
-      const plugins = (cfg.plugins ?? {}) as PluginsConfig;
-      const entries = { ...(plugins.entries ?? {}) };
-      const entry = { ...(entries["tmux-watch"] ?? {}) };
-      const entryConfig = { ...(entry.config ?? {}) };
+      let target = options.target?.trim() || "";
+      let label = options.label?.trim() || undefined;
+      let note = options.note?.trim() || undefined;
 
-      entry.enabled = true;
-      entry.config = {
-        ...entryConfig,
+      if (!target && process.stdin.isTTY) {
+        const panes = await listTmuxPanes(api, socket);
+        if (panes.length === 0) {
+          throw new Error("No tmux panes found for onboarding.");
+        }
+        const selected = await promptPaneSelection(logger, panes);
+        target = selected.target;
+        if (!label) {
+          label = (await promptText("Optional label (Enter to skip): ")) ?? undefined;
+        }
+        if (!note) {
+          note = (await promptText("Optional note (Enter to skip): ")) ?? undefined;
+        }
+      }
+
+      if (!target) {
+        const cfg = api.runtime.config.loadConfig();
+        const plugins = (cfg.plugins ?? {}) as PluginsConfig;
+        const entries = { ...(plugins.entries ?? {}) };
+        const entry = { ...(entries["tmux-watch"] ?? {}) };
+        const entryConfig = { ...(entry.config ?? {}) };
+
+        entry.enabled = true;
+        entry.config = {
+          ...entryConfig,
+          socket,
+        };
+
+        entries["tmux-watch"] = entry;
+
+        await api.runtime.config.writeConfigFile({
+          ...cfg,
+          plugins: {
+            ...plugins,
+            entries,
+          },
+        });
+
+        logger.info(`tmux-watch configured. socket=${socket}`);
+        logger.info("Re-run with --target or use an interactive TTY to create a subscription.");
+        logger.info("Restart the Gateway for changes to take effect.");
+        return;
+      }
+
+      const result = await setupTmuxWatch({
+        api,
+        logger,
         socket,
-      };
-
-      entries["tmux-watch"] = entry;
-
-      await api.runtime.config.writeConfigFile({
-        ...cfg,
-        plugins: {
-          ...plugins,
-          entries,
-        },
+        target,
+        label,
+        note,
       });
 
-      logger.info(`tmux-watch configured. socket=${socket}`);
+      logger.info(`tmux-watch configured. socket=${result.socket}`);
+      logger.info(`Subscription created for ${result.subscription.target}.`);
       logger.info("Restart the Gateway for changes to take effect.");
     });
 

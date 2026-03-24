@@ -16,6 +16,9 @@ type ToolParams = {
   intervalMs?: number;
   stableCount?: number;
   stableSeconds?: number;
+  cooldownSeconds?: number;
+  minOutputChars?: number;
+  ignoreWhitespaceOnlyChanges?: boolean;
   captureLines?: number;
   stripAnsi?: boolean;
   format?: string;
@@ -93,12 +96,30 @@ export function createTmuxWatchTool(manager: TmuxWatchManager) {
         sessionKey: { type: "string", description: "Session key override." },
         socket: { type: "string", description: "tmux socket path (for -S)." },
         captureIntervalSeconds: { type: "number", description: "Capture interval in seconds." },
-        intervalMs: { type: "number", description: "Legacy: capture interval in ms." },
+        intervalMs: {
+          type: "number",
+          description: "Legacy compatibility: capture interval in ms.",
+        },
         stableCount: {
           type: "number",
           description: "Consecutive identical captures before alert.",
         },
-        stableSeconds: { type: "number", description: "Legacy: stable duration in seconds." },
+        stableSeconds: {
+          type: "number",
+          description: "Legacy compatibility: stable duration in seconds.",
+        },
+        cooldownSeconds: {
+          type: "number",
+          description: "Suppress repeated notifications for this many seconds.",
+        },
+        minOutputChars: {
+          type: "number",
+          description: "Skip notifications when output is shorter than this length.",
+        },
+        ignoreWhitespaceOnlyChanges: {
+          type: "boolean",
+          description: "Treat whitespace-only output changes as unchanged.",
+        },
         captureLines: { type: "number", description: "Lines to capture." },
         stripAnsi: { type: "boolean", description: "Strip ANSI escape codes." },
         format: { type: "string", description: "Capture format: text, image, or both." },
@@ -159,6 +180,14 @@ export function createTmuxWatchTool(manager: TmuxWatchManager) {
                 typeof params.stableCount === "number" ? params.stableCount : undefined,
               stableSeconds:
                 typeof params.stableSeconds === "number" ? params.stableSeconds : undefined,
+              cooldownSeconds:
+                typeof params.cooldownSeconds === "number" ? params.cooldownSeconds : undefined,
+              minOutputChars:
+                typeof params.minOutputChars === "number" ? params.minOutputChars : undefined,
+              ignoreWhitespaceOnlyChanges:
+                typeof params.ignoreWhitespaceOnlyChanges === "boolean"
+                  ? params.ignoreWhitespaceOnlyChanges
+                  : undefined,
               captureLines:
                 typeof params.captureLines === "number" ? params.captureLines : undefined,
               stripAnsi: typeof params.stripAnsi === "boolean" ? params.stripAnsi : undefined,

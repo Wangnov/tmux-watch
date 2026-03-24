@@ -49,6 +49,9 @@ openclaw plugins install ./tmux-watch.tgz
           "socket": "/private/tmp/tmux-501/default",
           "captureIntervalSeconds": 10,
           "stableCount": 6,
+          "cooldownSeconds": 120,
+          "minOutputChars": 8,
+          "ignoreWhitespaceOnlyChanges": true,
           "captureLines": 50,
           "stripAnsi": true,
           "maxOutputChars": 4000,
@@ -73,6 +76,10 @@ openclaw plugins install ./tmux-watch.tgz
 - `stableCount`：连续多少次捕获内容一致才触发告警，默认 `6`。总时长 = `captureIntervalSeconds × stableCount`（例如 `3 × 5 = 15s`）。
 - `pollIntervalMs`：**兼容字段**，捕获间隔（毫秒）。仅在需要与旧配置兼容时使用。
 - `stableSeconds`：**兼容字段**，稳定时长（秒）。会按当前捕获间隔换算成次数。
+- 兼容字段在插件内部会被统一折算为 `captureIntervalSeconds` 和 `stableCount`；新配置推荐直接使用新版字段。
+- `cooldownSeconds`：同一订阅两次告警之间的最小间隔（秒），默认 `120`。
+- `minOutputChars`：输出少于该长度时不告警，默认 `8`。
+- `ignoreWhitespaceOnlyChanges`：是否忽略仅空白变化导致的“新输出”，默认 `true`。
 - `captureLines`：从 pane 末尾向上截取的行数（默认 `50`）。
 - `stripAnsi`：是否剥离 ANSI 转义码（默认 `true`）。
 - `maxOutputChars`：通知中最多包含的输出字符数（默认 `4000`，超出将从末尾截断）。
@@ -82,16 +89,16 @@ openclaw plugins install ./tmux-watch.tgz
 
 ### 快速配置（onboarding）
 
-插件提供一个最小化向导，仅要求设置 `socket`：
+插件现在提供一键向导：先确定 `socket`，再让你选择一个 pane，并顺手创建 subscription。
 
 ```bash
 openclaw tmux-watch setup
 ```
 
-你也可以手动指定：
+你也可以显式指定目标，一步完成：
 
 ```bash
-openclaw tmux-watch setup --socket "/private/tmp/tmux-501/default"
+openclaw tmux-watch setup --socket "/private/tmp/tmux-501/default" --target "work:0.1"
 ```
 
 #### socket 如何获取
@@ -240,6 +247,10 @@ Edit `~/.openclaw/openclaw.json`:
 - `stableCount`: Number of consecutive identical captures before alert (default `6`). Total duration = `captureIntervalSeconds × stableCount` (for example `3 × 5 = 15s`).
 - `pollIntervalMs`: **Legacy** capture interval in milliseconds. Use only for backward compatibility.
 - `stableSeconds`: **Legacy** stable duration in seconds. Converted into counts using the current interval.
+- Legacy timing fields are normalized internally into `captureIntervalSeconds` and `stableCount`; prefer the canonical fields in new configs.
+- `cooldownSeconds`: Minimum interval between notifications for the same subscription in seconds (default `120`).
+- `minOutputChars`: Skip alerts when the captured output is shorter than this length (default `8`).
+- `ignoreWhitespaceOnlyChanges`: Ignore output changes that only differ by whitespace (default `true`).
 - `captureLines`: Lines captured from the bottom of the pane (default `50`).
 - `stripAnsi`: Strip ANSI escape codes (default `true`).
 - `maxOutputChars`: Max output chars in the notification (default `4000`, tail-truncated).
@@ -265,16 +276,16 @@ Use the path before the first comma as `socket`.
 
 ### Quick setup (onboarding)
 
-The plugin ships a minimal setup wizard that only requires the `socket`:
+The plugin now ships a one-step setup wizard: resolve the `socket`, choose a pane, and create a subscription immediately.
 
 ```bash
 openclaw tmux-watch setup
 ```
 
-Or pass it explicitly:
+Or make it fully non-interactive:
 
 ```bash
-openclaw tmux-watch setup --socket "/private/tmp/tmux-501/default"
+openclaw tmux-watch setup --socket "/private/tmp/tmux-501/default" --target "work:0.1"
 ```
 
 ### Add a subscription (via agent tool)
