@@ -12,6 +12,7 @@ import {
   type NotifyTarget,
   type TmuxWatchConfig,
 } from "./config.js";
+import { normalizeTmuxSocket } from "./socket.js";
 
 export type TmuxWatchSubscription = {
   id: string;
@@ -43,13 +44,20 @@ type PersistedState = {
 };
 
 type WatchRuntime = {
-  running: boolean;
+  runningPollId?: number;
+  runningStartedAt?: number;
   stableTicks: number;
   lastHash?: string;
   lastOutput?: string;
   lastCapturedAt?: number;
   lastNotifiedHash?: string;
   lastNotifiedAt?: number;
+  notifyInFlight?: {
+    hash: string;
+    pollId: number;
+    token: string;
+    startedAt: number;
+  };
   lastError?: string;
   timer?: NodeJS.Timeout;
 };
@@ -92,6 +100,8 @@ type MinimalConfig = {
 const STATE_VERSION = 1;
 const INTERNAL_LAST_CHANNELS = new Set(["webchat", "tui"]);
 const TEMP_FILE_SUFFIX = ".tmp";
+const STATE_SYNC_INTERVAL_MS = 1000;
+const POLL_RUNNING_TIMEOUT_MS = 120_000;
 
 export class TmuxWatchManager {
   private readonly api: OpenClawPluginApi;
@@ -100,6 +110,10 @@ export class TmuxWatchManager {
   private stateDir: string | null = null;
   private loaded = false;
   private active = false;
+  private stateMtimeMs = 0;
+  private stateSyncPromise: Promise<void> | null = null;
+  private stateSyncTimer: NodeJS.Timeout | null = null;
+  private pollIdCounter = 0;
 
   constructor(api: OpenClawPluginApi) {
     this.api = api;
@@ -114,6 +128,11 @@ export class TmuxWatchManager {
     this.stateDir = ctx.stateDir ?? null;
     this.active = true;
     await this.ensureLoaded();
+    this.startStateSyncLoop();
+    this.debugLog("manager started", {
+      statePath: this.getStatePath(),
+      subscriptions: this.entries.size,
+    });
     for (const entry of this.entries.values()) {
       this.startWatch(entry);
     }
@@ -121,12 +140,35 @@ export class TmuxWatchManager {
 
   async stop(): Promise<void> {
     this.active = false;
+    this.stopStateSyncLoop();
+    this.debugLog("manager stopping", { subscriptions: this.entries.size });
     for (const entry of this.entries.values()) {
-      if (entry.runtime.timer) {
-        clearInterval(entry.runtime.timer);
-        entry.runtime.timer = undefined;
-      }
+      this.stopWatchTimer(entry);
     }
+  }
+
+  private debugLog(message: string, details?: Record<string, unknown>): void {
+    if (!this.config.debug) {
+      return;
+    }
+    const suffix = details ? ` ${safeJson(details)}` : "";
+    this.api.logger.debug(`[tmux-watch][debug] ${message}${suffix}`);
+  }
+
+  private debugSubscription(
+    subscription: TmuxWatchSubscription,
+    message: string,
+    details?: Record<string, unknown>,
+  ): void {
+    if (!this.config.debug) {
+      return;
+    }
+    const context: Record<string, unknown> = {
+      id: subscription.id,
+      target: subscription.target,
+      label: subscription.label,
+    };
+    this.debugLog(message, details ? { ...context, ...details } : context);
   }
 
   async listSubscriptions(options?: { includeOutput?: boolean }) {
@@ -170,12 +212,14 @@ export class TmuxWatchManager {
     };
     const runtime = existing?.runtime ?? createRuntime();
     this.entries.set(id, { subscription, runtime });
+    this.debugSubscription(subscription, existing ? "subscription updated" : "subscription added", {
+      enabled: subscription.enabled !== false,
+    });
     await this.saveState();
     if (this.active && subscription.enabled !== false) {
       this.startWatch(this.entries.get(id)!);
-    } else if (existing?.runtime.timer) {
-      clearInterval(existing.runtime.timer);
-      existing.runtime.timer = undefined;
+    } else if (existing) {
+      this.stopWatchTimer(existing);
     }
     return subscription;
   }
@@ -184,13 +228,12 @@ export class TmuxWatchManager {
     await this.ensureLoaded();
     const entry = this.entries.get(id);
     if (!entry) {
+      this.debugLog("remove subscription skipped because id missing", { id });
       return false;
     }
-    if (entry.runtime.timer) {
-      clearInterval(entry.runtime.timer);
-      entry.runtime.timer = undefined;
-    }
+    this.stopWatchTimer(entry);
     this.entries.delete(id);
+    this.debugSubscription(entry.subscription, "subscription removed");
     await this.saveState();
     return true;
   }
@@ -209,7 +252,13 @@ export class TmuxWatchManager {
         runtime: createRuntime(),
       });
     }
+    this.stateMtimeMs = await this.readStateMtimeMs();
     this.loaded = true;
+    this.debugLog("state loaded", {
+      statePath: this.getStatePath(),
+      subscriptions: this.entries.size,
+      mtimeMs: this.stateMtimeMs,
+    });
   }
 
   private getStatePath(): string {
@@ -251,6 +300,12 @@ export class TmuxWatchManager {
       subscriptions: Array.from(this.entries.values()).map((entry) => entry.subscription),
     };
     await writeTextAtomic(filePath, JSON.stringify(payload, null, 2));
+    this.stateMtimeMs = await this.readStateMtimeMs();
+    this.debugLog("state saved", {
+      statePath: filePath,
+      subscriptions: payload.subscriptions.length,
+      mtimeMs: this.stateMtimeMs,
+    });
   }
 
   private async quarantineInvalidState(filePath: string, reason: string): Promise<void> {
@@ -268,32 +323,238 @@ export class TmuxWatchManager {
     }
   }
 
-  private startWatch(entry: WatchEntry): void {
+  private async readStateMtimeMs(): Promise<number> {
+    const filePath = this.getStatePath();
+    try {
+      const stat = await fs.stat(filePath);
+      return stat.mtimeMs;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return 0;
+      }
+      return this.stateMtimeMs;
+    }
+  }
+
+  private async loadStateForSync(): Promise<PersistedState | null> {
+    const filePath = this.getStatePath();
+    try {
+      const raw = await fs.readFile(filePath, "utf8");
+      const parsed = JSON.parse(raw) as PersistedState;
+      if (!parsed || parsed.version !== STATE_VERSION || !Array.isArray(parsed.subscriptions)) {
+        this.debugLog("state sync skipped because persisted state shape is invalid", {
+          statePath: filePath,
+        });
+        return null;
+      }
+      return parsed;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return { version: STATE_VERSION, subscriptions: [] };
+      }
+      return null;
+    }
+  }
+
+  private async syncStateFromDiskIfNeeded(): Promise<void> {
+    if (!this.loaded) {
+      return;
+    }
+    if (this.stateSyncPromise) {
+      await this.stateSyncPromise;
+      return;
+    }
+    this.stateSyncPromise = (async () => {
+      const mtimeMs = await this.readStateMtimeMs();
+      if (mtimeMs === this.stateMtimeMs) {
+        return;
+      }
+      this.debugLog("state changed on disk; reconciling", {
+        previousMtimeMs: this.stateMtimeMs,
+        nextMtimeMs: mtimeMs,
+      });
+      const state = await this.loadStateForSync();
+      if (!state) {
+        return;
+      }
+      this.stateMtimeMs = mtimeMs;
+      this.reconcileEntriesFromState(state);
+    })().finally(() => {
+      this.stateSyncPromise = null;
+    });
+    await this.stateSyncPromise;
+  }
+
+  private reconcileEntriesFromState(state: PersistedState): void {
+    const previousSize = this.entries.size;
+    const nextSubscriptions = new Map<string, TmuxWatchSubscription>();
+    for (const subscription of state.subscriptions) {
+      if (!subscription.id || !subscription.target) {
+        continue;
+      }
+      nextSubscriptions.set(subscription.id, subscription);
+    }
+
+    for (const [id, entry] of this.entries) {
+      if (nextSubscriptions.has(id)) {
+        continue;
+      }
+      this.stopWatchTimer(entry);
+      this.entries.delete(id);
+    }
+
+    for (const [id, subscription] of nextSubscriptions) {
+      const existing = this.entries.get(id);
+      if (!existing) {
+        const entry: WatchEntry = {
+          subscription,
+          runtime: createRuntime(),
+        };
+        this.entries.set(id, entry);
+        if (this.active && subscription.enabled !== false) {
+          this.startWatch(entry);
+        }
+        continue;
+      }
+      existing.subscription = subscription;
+      if (this.active && subscription.enabled !== false) {
+        this.startWatch(existing);
+      } else {
+        this.stopWatchTimer(existing);
+      }
+    }
+    this.debugLog("state reconciled", {
+      previousSubscriptions: previousSize,
+      nextSubscriptions: this.entries.size,
+    });
+  }
+
+  private isManagedEntry(entry: WatchEntry): boolean {
+    const id = entry.subscription.id;
+    if (!id) {
+      return false;
+    }
+    return this.entries.get(id) === entry;
+  }
+
+  private shouldWatchEntry(entry: WatchEntry): boolean {
+    return this.active && this.isManagedEntry(entry) && entry.subscription.enabled !== false;
+  }
+
+  private stopWatchTimer(entry: WatchEntry): void {
     if (entry.runtime.timer) {
       clearInterval(entry.runtime.timer);
       entry.runtime.timer = undefined;
+      this.debugSubscription(entry.subscription, "watch timer stopped");
     }
+  }
+
+  private startStateSyncLoop(): void {
+    this.stopStateSyncLoop();
+    if (!this.active) {
+      return;
+    }
+    this.stateSyncTimer = setInterval(() => {
+      void this.syncStateFromDiskIfNeeded().catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.debugLog("state sync tick failed", { error: message });
+      });
+    }, STATE_SYNC_INTERVAL_MS);
+    this.stateSyncTimer.unref?.();
+    this.debugLog("state sync timer started", {
+      intervalMs: STATE_SYNC_INTERVAL_MS,
+    });
+  }
+
+  private stopStateSyncLoop(): void {
+    if (!this.stateSyncTimer) {
+      return;
+    }
+    clearInterval(this.stateSyncTimer);
+    this.stateSyncTimer = null;
+    this.debugLog("state sync timer stopped");
+  }
+
+  private startWatch(entry: WatchEntry): void {
+    this.stopWatchTimer(entry);
     if (entry.subscription.enabled === false) {
+      this.debugSubscription(entry.subscription, "watch skipped because disabled");
       return;
     }
     const intervalMs = resolveIntervalMs(entry.subscription, this.config);
+    this.debugSubscription(entry.subscription, "watch timer started", {
+      intervalMs,
+      stableCount: resolveStableCount(entry.subscription, this.config),
+      notifyMode: resolveNotifyMode(entry.subscription, this.config),
+    });
     entry.runtime.timer = setInterval(() => {
-      void this.pollWatch(entry).catch((err) => {
+      void (async () => {
+        await this.syncStateFromDiskIfNeeded();
+        await this.pollWatch(entry);
+      })().catch((err) => {
         entry.runtime.lastError = err instanceof Error ? err.message : String(err);
+        this.debugSubscription(entry.subscription, "watch tick failed", {
+          error: entry.runtime.lastError,
+        });
       });
     }, intervalMs);
     entry.runtime.timer.unref?.();
   }
 
   private async pollWatch(entry: WatchEntry): Promise<void> {
-    if (entry.runtime.running) {
+    if (!this.shouldWatchEntry(entry)) {
+      this.debugSubscription(entry.subscription, "poll skipped because entry is not watchable", {
+        active: this.active,
+        managed: this.isManagedEntry(entry),
+        enabled: entry.subscription.enabled !== false,
+      });
+      this.stopWatchTimer(entry);
       return;
     }
-    entry.runtime.running = true;
+    if (entry.runtime.runningPollId != null) {
+      const elapsed = entry.runtime.runningStartedAt
+        ? Date.now() - entry.runtime.runningStartedAt
+        : 0;
+      if (elapsed < POLL_RUNNING_TIMEOUT_MS) {
+        this.debugSubscription(entry.subscription, "poll skipped because previous tick still running", {
+          pollId: entry.runtime.runningPollId,
+          elapsedMs: elapsed,
+        });
+        return;
+      }
+      this.api.logger.warn("[tmux-watch] previous poll timed out; force-resetting running flag");
+      this.debugSubscription(entry.subscription, "running flag force-reset after timeout", {
+        stalePollId: entry.runtime.runningPollId,
+        elapsedMs: elapsed,
+        timeoutMs: POLL_RUNNING_TIMEOUT_MS,
+      });
+      entry.runtime.runningPollId = undefined;
+      entry.runtime.runningStartedAt = undefined;
+    }
+    const pollId = ++this.pollIdCounter;
+    entry.runtime.runningPollId = pollId;
+    entry.runtime.runningStartedAt = Date.now();
+    const isStale = () => entry.runtime.runningPollId !== pollId;
+    const subscription = { ...entry.subscription };
     try {
-      const output = await this.captureOutput(entry.subscription);
+      const output = await this.captureOutput(subscription);
+      if (isStale()) {
+        this.debugSubscription(subscription, "poll abandoned after capture; ownership lost", {
+          pollId,
+          currentPollId: entry.runtime.runningPollId,
+        });
+        return;
+      }
       if (output === null) {
-        entry.runtime.stableTicks = 0;
+        entry.runtime.lastError = "capture returned null";
+        this.debugSubscription(subscription, "capture returned null; skipping tick", {
+          stableTicks: entry.runtime.stableTicks,
+        });
+        return;
+      }
+      if (!this.shouldWatchEntry(entry)) {
+        this.debugSubscription(subscription, "poll aborted because entry became unwatchable");
+        this.stopWatchTimer(entry);
         return;
       }
       entry.runtime.lastCapturedAt = Date.now();
@@ -303,6 +564,7 @@ export class TmuxWatchManager {
         resolveIgnoreWhitespaceOnlyChanges(entry.subscription, this.config),
       );
       const hash = hashOutput(comparableOutput);
+      const previousHash = entry.runtime.lastHash;
       if (entry.runtime.lastHash && entry.runtime.lastHash === hash) {
         entry.runtime.stableTicks += 1;
       } else {
@@ -311,24 +573,111 @@ export class TmuxWatchManager {
         entry.runtime.stableTicks = 0;
         entry.runtime.lastNotifiedHash = undefined;
       }
-      const stableTicks = resolveStableTicks(entry.subscription, this.config);
+      const stableTicks = resolveStableTicks(subscription, this.config);
+      this.debugSubscription(subscription, "poll captured", {
+        outputChars: output.length,
+        hash: hash.slice(0, 12),
+        previousHash: previousHash?.slice(0, 12),
+        stableTicks: entry.runtime.stableTicks,
+        stableTicksRequired: stableTicks,
+      });
       if (entry.runtime.stableTicks >= stableTicks) {
         if (entry.runtime.lastNotifiedHash !== hash) {
-          if (shouldNotifyForStableOutput(entry.runtime, entry.subscription, this.config, output)) {
+          if (!shouldNotifyForStableOutput(entry.runtime, entry.subscription, this.config, output)) {
+            this.debugSubscription(subscription, "stability reached but notify suppressed by denoise", {
+              outputChars: output.length,
+            });
+            return;
+          }
+          if (isStale()) {
+            this.debugSubscription(subscription, "poll abandoned before notify; ownership lost", {
+              pollId,
+              currentPollId: entry.runtime.runningPollId,
+            });
+            return;
+          }
+          const now = Date.now();
+          const existingNotifyInFlight = entry.runtime.notifyInFlight;
+          if (
+            existingNotifyInFlight &&
+            existingNotifyInFlight.hash === hash &&
+            existingNotifyInFlight.pollId !== pollId
+          ) {
+            const elapsedMs = now - existingNotifyInFlight.startedAt;
+            if (elapsedMs < POLL_RUNNING_TIMEOUT_MS) {
+              this.debugSubscription(subscription, "notify skipped because same hash is already in-flight", {
+                hash: hash.slice(0, 12),
+                inFlightPollId: existingNotifyInFlight.pollId,
+                elapsedMs,
+              });
+              return;
+            }
+            this.debugSubscription(subscription, "stale notify in-flight marker force-reset after timeout", {
+              hash: hash.slice(0, 12),
+              stalePollId: existingNotifyInFlight.pollId,
+              elapsedMs,
+              timeoutMs: POLL_RUNNING_TIMEOUT_MS,
+            });
+          }
+          const notifyToken = randomUUID();
+          entry.runtime.notifyInFlight = {
+            hash,
+            pollId,
+            token: notifyToken,
+            startedAt: now,
+          };
+          const canSend = () =>
+            !isStale() &&
+            this.isManagedEntry(entry) &&
+            entry.runtime.notifyInFlight?.hash === hash &&
+            entry.runtime.notifyInFlight?.token === notifyToken;
+          let notified = false;
+          try {
+            if (!canSend()) {
+              this.debugSubscription(subscription, "notify aborted before dispatch; ownership lost");
+              return;
+            }
+            this.debugSubscription(subscription, "stability reached; notifying", {
+              stableTicks: entry.runtime.stableTicks,
+              stableTicksRequired: stableTicks,
+            });
+            notified = await this.notifyStable(subscription, output, canSend);
+          } finally {
+            if (entry.runtime.notifyInFlight?.token === notifyToken) {
+              entry.runtime.notifyInFlight = undefined;
+            }
+          }
+          if (isStale()) {
+            this.debugSubscription(subscription, "poll abandoned after notify; ownership lost", {
+              pollId,
+              currentPollId: entry.runtime.runningPollId,
+            });
+            return;
+          }
+          if (notified) {
             entry.runtime.lastNotifiedHash = hash;
             entry.runtime.lastNotifiedAt = Date.now();
-            await this.notifyStable(entry.subscription, output);
+          } else {
+            this.debugSubscription(subscription, "notify failed; will retry on next stable tick");
           }
+        } else {
+          this.debugSubscription(subscription, "stability reached but notify skipped", {
+            reason: "already notified for same hash",
+          });
         }
       }
     } finally {
-      entry.runtime.running = false;
+      if (entry.runtime.runningPollId === pollId) {
+        entry.runtime.runningPollId = undefined;
+        entry.runtime.runningStartedAt = undefined;
+      }
     }
   }
 
   private async captureOutput(subscription: TmuxWatchSubscription): Promise<string | null> {
     const target = subscription.target.trim();
     if (!target) {
+      this.debugSubscription(subscription, "capture skipped because target empty");
       return null;
     }
 
@@ -352,6 +701,10 @@ export class TmuxWatchManager {
         if (stderr) {
           this.api.logger.warn(`[tmux-watch] tmux error: ${stderr}`);
         }
+        this.debugSubscription(subscription, "capture command failed", {
+          exitCode: result.code,
+          stderr: stderr || "",
+        });
         return null;
       }
       let output = result.stdout ?? "";
@@ -359,10 +712,14 @@ export class TmuxWatchManager {
       if (resolveStripAnsi(subscription, this.config)) {
         output = stripAnsi(output);
       }
+      this.debugSubscription(subscription, "capture command succeeded", {
+        outputChars: output.length,
+      });
       return output;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.api.logger.warn(`[tmux-watch] tmux capture failed: ${message}`);
+      this.debugSubscription(subscription, "capture command threw", { error: message });
       return null;
     }
   }
@@ -370,20 +727,54 @@ export class TmuxWatchManager {
   private async notifyStable(
     subscription: TmuxWatchSubscription,
     output: string,
-  ): Promise<void> {
-    const sessionKey = normalizeSessionKey(
-      subscription.sessionKey ?? this.config.sessionKey,
-      this.api.config,
-    );
+    canSend: () => boolean,
+  ): Promise<boolean> {
+    this.debugSubscription(subscription, "notify pipeline started", {
+      outputChars: output.length,
+    });
+    if (!canSend()) {
+      this.debugSubscription(subscription, "notify aborted before session resolution; poll ownership lost");
+      return false;
+    }
+    let sessionKey: string;
+    try {
+      sessionKey = normalizeSessionKey(
+        subscription.sessionKey ?? this.config.sessionKey,
+        this.api.config,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.api.logger.warn(`[tmux-watch] invalid sessionKey: ${message}`);
+      this.debugSubscription(subscription, "notify skipped because sessionKey invalid", {
+        error: message,
+      });
+      return false;
+    }
     if (!sessionKey) {
       this.api.logger.warn("[tmux-watch] missing sessionKey; skipping notify");
-      return;
+      this.debugSubscription(subscription, "notify skipped because sessionKey missing");
+      return false;
     }
     const targets = await this.resolveNotifyTargets(subscription, sessionKey);
+    if (!canSend()) {
+      this.debugSubscription(subscription, "notify aborted after target resolution; poll ownership lost");
+      return false;
+    }
     if (targets.length === 0) {
       this.api.logger.warn("[tmux-watch] no notify targets resolved; skipping notify");
-      return;
+      this.debugSubscription(subscription, "notify skipped because no targets resolved", {
+        sessionKey,
+      });
+      return false;
     }
+    this.debugSubscription(subscription, "notify targets resolved", {
+      sessionKey,
+      targets: targets.map((target) => ({
+        channel: target.channel,
+        target: target.target,
+        source: target.source,
+      })),
+    });
     const primary = targets[0]!;
     const outputInfo = truncateOutput(output, this.config.maxOutputChars);
 
@@ -458,18 +849,295 @@ export class TmuxWatchManager {
       ChatType: "direct",
     };
 
-    await this.api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-      ctx,
-      cfg: this.api.config,
-      dispatcherOptions: {
-        deliver: async () => {},
-        onError: (err: unknown) => {
-          this.api.logger.warn(
-            `[tmux-watch] dispatch error: ${err instanceof Error ? err.message : String(err)}`,
-          );
+    let dispatchedPrimary = false;
+    try {
+      if (!canSend()) {
+        this.debugSubscription(subscription, "dispatch aborted; poll ownership lost");
+        return false;
+      }
+      this.debugSubscription(subscription, "dispatching to reply pipeline", {
+        primaryChannel: primary.channel,
+        primaryTarget: primary.target,
+      });
+      await this.api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+        ctx,
+        cfg: this.api.config,
+        dispatcherOptions: {
+          deliver: async (payload: unknown, info: { kind: string }) => {
+            if (info.kind !== "final") {
+              this.debugSubscription(subscription, "dispatcher ignored non-final payload", {
+                payloadKind: info.kind,
+              });
+              return;
+            }
+            const text = extractReplyText(payload);
+            if (!text) {
+              this.debugSubscription(subscription, "dispatcher final payload missing text");
+              return;
+            }
+            this.debugSubscription(subscription, "dispatcher produced final text", {
+              textChars: text.length,
+            });
+            if (!canSend()) {
+              this.debugSubscription(subscription, "deliver aborted; poll ownership lost");
+              return;
+            }
+            if (
+              await this.sendToTarget(
+                primary,
+                text,
+                {
+                  subscriptionId: subscription.id,
+                  phase: "primary-dispatch",
+                },
+                canSend,
+              )
+            ) {
+              dispatchedPrimary = true;
+            }
+          },
+          onError: (err: unknown) => {
+            this.api.logger.warn(
+              `[tmux-watch] dispatch error: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            this.debugSubscription(subscription, "dispatch callback error", {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          },
         },
-      },
+      });
+    } catch (err) {
+      this.api.logger.warn(
+        `[tmux-watch] notify dispatch failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      this.debugSubscription(subscription, "notify dispatch threw", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    if (!dispatchedPrimary) {
+      if (!canSend()) {
+        this.debugSubscription(subscription, "fallback aborted; poll ownership lost");
+        return false;
+      }
+      this.debugSubscription(subscription, "dispatch produced no primary output; fallback to raw body");
+      dispatchedPrimary = await this.sendToTarget(
+        primary,
+        body,
+        {
+          subscriptionId: subscription.id,
+          phase: "primary-fallback",
+        },
+        canSend,
+      );
+    }
+
+    if (dispatchedPrimary && targets.length > 1) {
+      const mirrorText = body;
+      for (const target of targets.slice(1)) {
+        if (!canSend()) {
+          this.debugSubscription(subscription, "mirror send aborted; poll ownership lost");
+          break;
+        }
+        await this.sendToTarget(
+          target,
+          mirrorText,
+          {
+            subscriptionId: subscription.id,
+            phase: "mirror",
+          },
+          canSend,
+        );
+      }
+    }
+    this.debugSubscription(subscription, "notify pipeline completed", {
+      dispatchedPrimary,
+      mirroredCount: dispatchedPrimary ? Math.max(0, targets.length - 1) : 0,
     });
+    return dispatchedPrimary;
+  }
+
+  private async sendToTarget(
+    target: ResolvedTarget,
+    text: string,
+    context?: { subscriptionId?: string; phase?: string },
+    canSend?: () => boolean,
+  ): Promise<boolean> {
+    const channel = target.channel.trim().toLowerCase();
+    if (!channel || !text.trim()) {
+      this.debugLog("send skipped due to empty channel or text", {
+        channel: target.channel,
+        target: target.target,
+        subscriptionId: context?.subscriptionId,
+        phase: context?.phase,
+      });
+      return false;
+    }
+    const accountId = target.accountId?.trim() || undefined;
+    const threadId = parseThreadId(target.threadId);
+    this.debugLog("send attempt", {
+      channel,
+      target: target.target,
+      accountId,
+      threadId,
+      source: target.source,
+      textChars: text.length,
+      subscriptionId: context?.subscriptionId,
+      phase: context?.phase,
+    });
+
+    try {
+      // 最终检查：紧邻发送前，确保 ownership 仍然有效
+      // 这是缩小 TOCTOU 窗口的关键点
+      if (canSend && !canSend()) {
+        this.debugLog("send aborted due to stale notify ownership", {
+          channel: target.channel,
+          target: target.target,
+          subscriptionId: context?.subscriptionId,
+          phase: context?.phase,
+        });
+        return false;
+      }
+
+      switch (channel) {
+        case "telegram": {
+          // 最终检查紧邻 await，最小化 TOCTOU 窗口
+          if (canSend && !canSend()) {
+            this.debugLog("telegram send aborted at last checkpoint", {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
+          await this.api.runtime.channel.telegram.sendMessage(target.target, text, {
+            accountId,
+            messageThreadId: threadId,
+          });
+          break;
+        }
+        case "slack": {
+          if (canSend && !canSend()) {
+            this.debugLog("slack send aborted at last checkpoint", {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
+          await this.api.runtime.channel.slack.sendMessage(target.target, text, {
+            accountId,
+            threadTs: threadId != null ? String(threadId) : undefined,
+          });
+          break;
+        }
+        case "discord": {
+          if (canSend && !canSend()) {
+            this.debugLog("discord send aborted at last checkpoint", {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
+          await this.api.runtime.channel.discord.sendMessage(target.target, text, {
+            accountId,
+            replyTo: threadId != null ? String(threadId) : undefined,
+          });
+          break;
+        }
+        case "signal": {
+          if (canSend && !canSend()) {
+            this.debugLog("signal send aborted at last checkpoint", {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
+          await this.api.runtime.channel.signal.sendMessage(target.target, text, {
+            accountId,
+          });
+          break;
+        }
+        case "imessage": {
+          if (canSend && !canSend()) {
+            this.debugLog("imessage send aborted at last checkpoint", {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
+          await this.api.runtime.channel.imessage.sendMessage(target.target, text, {
+            accountId,
+          });
+          break;
+        }
+        case "line": {
+          if (canSend && !canSend()) {
+            this.debugLog("line send aborted at last checkpoint", {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
+          await this.api.runtime.channel.line.sendMessage(target.target, text, {
+            accountId,
+          });
+          break;
+        }
+        case "whatsapp":
+        case "gewe-openclaw":
+        case "web":
+        case "webchat": {
+          if (canSend && !canSend()) {
+            this.debugLog(`${channel} send aborted at last checkpoint`, {
+              target: target.target,
+              subscriptionId: context?.subscriptionId,
+              phase: context?.phase,
+            });
+            return false;
+          }
+          await this.api.runtime.channel.whatsapp.sendMessage(target.target, text, {
+            accountId,
+          });
+          break;
+        }
+        default: {
+          this.api.logger.warn(`[tmux-watch] unsupported notify channel: ${target.channel}`);
+          this.debugLog("send failed due to unsupported channel", {
+            channel: target.channel,
+            target: target.target,
+            subscriptionId: context?.subscriptionId,
+            phase: context?.phase,
+          });
+          return false;
+        }
+      }
+      this.debugLog("send success", {
+        channel,
+        target: target.target,
+        subscriptionId: context?.subscriptionId,
+        phase: context?.phase,
+      });
+      return true;
+    } catch (err) {
+      this.api.logger.warn(
+        `[tmux-watch] send failed (${target.channel}:${target.target}): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      this.debugLog("send threw", {
+        channel: target.channel,
+        target: target.target,
+        error: err instanceof Error ? err.message : String(err),
+        subscriptionId: context?.subscriptionId,
+        phase: context?.phase,
+      });
+      return false;
+    }
   }
 
   private async resolveNotifyTargets(
@@ -483,6 +1151,9 @@ export class TmuxWatchManager {
 
     if (includeTargets) {
       const configured = resolveNotifyTargetList(subscription, this.config);
+      this.debugSubscription(subscription, "resolve notify targets from config", {
+        configuredCount: configured.length,
+      });
       for (const target of configured) {
         targets.push({
           channel: target.channel,
@@ -497,20 +1168,40 @@ export class TmuxWatchManager {
 
     if (includeLast) {
       const lastTargets = await this.resolveLastTargets(sessionKey);
+      this.debugSubscription(subscription, "resolve notify targets from last session", {
+        lastCount: lastTargets.length,
+        sessionKey,
+      });
       if (lastTargets.length > 0) {
         targets.push(...lastTargets);
       }
     }
 
-    return dedupeTargets(targets);
+    const deduped = dedupeTargets(targets);
+    this.debugSubscription(subscription, "notify target dedupe completed", {
+      before: targets.length,
+      after: deduped.length,
+    });
+    return deduped;
   }
 
   private async resolveLastTargets(sessionKey: string): Promise<ResolvedTarget[]> {
     const store = await this.readSessionStore(sessionKey);
     if (!store) {
+      this.debugLog("resolve last targets skipped: session store unavailable", { sessionKey });
       return [];
     }
-    return resolveLastTargetsFromStore({ store, sessionKey });
+    const targets = resolveLastTargetsFromStore({ store, sessionKey });
+    this.debugLog("resolved last targets", {
+      sessionKey,
+      count: targets.length,
+      targets: targets.map((target) => ({
+        channel: target.channel,
+        target: target.target,
+        source: target.source,
+      })),
+    });
+    return targets;
   }
 
   private async readSessionStore(
@@ -525,12 +1216,19 @@ export class TmuxWatchManager {
       const raw = await fs.readFile(storePath, "utf8");
       const store = JSON.parse(raw) as Record<string, SessionEntryLike>;
       if (!store || typeof store !== "object") {
+        this.debugLog("session store parsed to non-object", { sessionKey, storePath });
         return null;
       }
+      this.debugLog("session store loaded", {
+        sessionKey,
+        storePath,
+        entries: Object.keys(store).length,
+      });
       return store;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.api.logger.warn(`[tmux-watch] session store read failed: ${message}`);
+      this.debugLog("session store read failed", { sessionKey, storePath, error: message });
       return null;
     }
   }
@@ -542,7 +1240,6 @@ export function createTmuxWatchManager(api: OpenClawPluginApi) {
 
 function createRuntime(): WatchRuntime {
   return {
-    running: false,
     stableTicks: 0,
   };
 }
@@ -720,7 +1417,7 @@ function sanitizeSubscriptionInput(
     note: typeof input.note === "string" ? input.note.trim() : undefined,
     target: input.target.trim(),
     host: typeof input.host === "string" ? input.host.trim() : undefined,
-    socket: typeof input.socket === "string" ? input.socket.trim() : undefined,
+    socket: normalizeTmuxSocket(input.socket),
     sessionKey: typeof input.sessionKey === "string" ? input.sessionKey.trim() : undefined,
     captureIntervalSeconds: timing.captureIntervalSeconds,
     intervalMs: undefined,
@@ -757,7 +1454,7 @@ function normalizeStoredSubscription(
     note: typeof input.note === "string" ? input.note.trim() : undefined,
     target: input.target.trim(),
     host: typeof input.host === "string" ? input.host.trim() : undefined,
-    socket: typeof input.socket === "string" ? input.socket.trim() : undefined,
+    socket: normalizeTmuxSocket(input.socket),
     sessionKey: typeof input.sessionKey === "string" ? input.sessionKey.trim() : undefined,
     captureIntervalSeconds: timing.captureIntervalSeconds,
     intervalMs: undefined,
@@ -836,7 +1533,13 @@ function normalizeSessionKey(input: string | undefined, cfg?: MinimalConfig) {
     return "global";
   }
   const lowered = trimmed.toLowerCase();
-  if (lowered.startsWith("agent:") || lowered.startsWith("subagent:") || lowered === "global") {
+  if (lowered.startsWith("subagent:")) {
+    throw new Error(
+      `Invalid sessionKey "${trimmed}": subagent:* format is not supported. ` +
+        `Use agent:<id>:<key> or omit sessionKey to use the default.`,
+    );
+  }
+  if (lowered.startsWith("agent:") || lowered === "global") {
     return lowered;
   }
   const defaultKey = resolveDefaultSessionKey(cfg);
@@ -982,6 +1685,22 @@ function parseThreadId(value: unknown): string | number | undefined {
     return Number.parseInt(trimmed, 10);
   }
   return trimmed;
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "\"[unserializable]\"";
+  }
+}
+
+export function extractReplyText(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+  const value = payload as { text?: unknown };
+  return typeof value.text === "string" ? value.text : undefined;
 }
 
 export { stripAnsi, truncateOutput };

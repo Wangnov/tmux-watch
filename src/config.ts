@@ -3,6 +3,7 @@ import {
   DEFAULT_STABLE_COUNT,
   normalizeTimingCompat,
 } from "./compat.js";
+import { normalizeTmuxSocket } from "./socket.js";
 
 export type NotifyMode = "last" | "targets" | "targets+last";
 
@@ -21,6 +22,7 @@ export type TmuxWatchHostProfile = {
 
 export type TmuxWatchConfig = {
   enabled: boolean;
+  debug: boolean;
   captureIntervalSeconds: number;
   stableCount: number;
   cooldownSeconds: number;
@@ -44,6 +46,7 @@ export const DEFAULT_IGNORE_WHITESPACE_ONLY_CHANGES = true;
 
 const DEFAULTS: Omit<TmuxWatchConfig, "captureIntervalSeconds" | "stableCount"> = {
   enabled: true,
+  debug: false,
   cooldownSeconds: DEFAULT_COOLDOWN_SECONDS,
   minOutputChars: DEFAULT_MIN_OUTPUT_CHARS,
   ignoreWhitespaceOnlyChanges: DEFAULT_IGNORE_WHITESPACE_ONLY_CHANGES,
@@ -130,7 +133,7 @@ function normalizeHosts(raw: unknown): Record<string, TmuxWatchHostProfile> {
     }
     hosts[normalizedName] = {
       sshCommand,
-      socket: readString(value.socket),
+      socket: normalizeTmuxSocket(value.socket),
     };
   }
   return hosts;
@@ -146,6 +149,7 @@ export function resolveTmuxWatchConfig(raw: unknown): TmuxWatchConfig {
 
   return {
     enabled: readBoolean(value.enabled, DEFAULTS.enabled),
+    debug: readBoolean(value.debug, DEFAULTS.debug),
     captureIntervalSeconds: timing.captureIntervalSeconds,
     stableCount: timing.stableCount,
     cooldownSeconds: Math.max(0, readNumber(value.cooldownSeconds, DEFAULTS.cooldownSeconds)),
@@ -158,7 +162,7 @@ export function resolveTmuxWatchConfig(raw: unknown): TmuxWatchConfig {
     stripAnsi: readBoolean(value.stripAnsi, DEFAULTS.stripAnsi),
     maxOutputChars,
     sessionKey: readString(value.sessionKey) ?? DEFAULTS.sessionKey,
-    socket: readString(value.socket) ?? DEFAULTS.socket,
+    socket: normalizeTmuxSocket(value.socket) ?? DEFAULTS.socket,
     hosts: normalizeHosts(value.hosts),
     notify: {
       mode: normalizeNotifyMode(notifyRaw.mode, DEFAULTS.notify.mode),

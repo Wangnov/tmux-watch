@@ -56,10 +56,14 @@ async function createWatchHarness(pluginConfig: Record<string, unknown> = {}) {
     entries: Map<string, unknown>;
     pollWatch: (entry: unknown) => Promise<void>;
     captureOutput: (entry: unknown) => Promise<string | null>;
-    notifyStable: (subscription: unknown, output: string) => Promise<void>;
-    tmuxAvailable: boolean;
+    notifyStable: (
+      subscription: unknown,
+      output: string,
+      canSend?: () => boolean,
+    ) => Promise<boolean>;
+    active: boolean;
   };
-  manager.tmuxAvailable = true;
+  manager.active = true;
 
   return {
     stateDir,
@@ -85,6 +89,7 @@ test("manager cooldown suppresses repeated notifications after a brief recovery"
   harness.manager.captureOutput = async () => outputs.shift() ?? null;
   harness.manager.notifyStable = async (_subscription, output) => {
     notified.push(output);
+    return true;
   };
 
   const originalNow = Date.now;
@@ -122,6 +127,7 @@ test("manager skips notifications when output is shorter than minOutputChars", a
   harness.manager.captureOutput = async () => outputs.shift() ?? null;
   harness.manager.notifyStable = async () => {
     notifyCount += 1;
+    return true;
   };
 
   await harness.manager.pollWatch(entry);
@@ -146,6 +152,7 @@ test("manager treats whitespace-only output changes as the same content when ena
   harness.manager.captureOutput = async () => outputs.shift() ?? null;
   harness.manager.notifyStable = async () => {
     notifyCount += 1;
+    return true;
   };
 
   await harness.manager.pollWatch(entry);

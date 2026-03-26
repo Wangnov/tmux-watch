@@ -1,5 +1,25 @@
 declare module "openclaw/plugin-sdk" {
   type TSchema = import("@sinclair/typebox").TSchema;
+
+  type BasicSendOptions = {
+    accountId?: string;
+  };
+
+  type TelegramSendOptions = BasicSendOptions & {
+    messageThreadId?: string | number;
+  };
+
+  type SlackSendOptions = BasicSendOptions & {
+    threadTs?: string;
+  };
+
+  type DiscordSendOptions = BasicSendOptions & {
+    replyTo?: string;
+  };
+
+  type ReplyPayload = {
+    text?: string;
+  };
   export type OpenClawConfig = {
     session?: {
       store?: unknown;
@@ -25,6 +45,7 @@ declare module "openclaw/plugin-sdk" {
     pluginConfig: unknown;
     config: OpenClawConfig;
     logger: {
+      debug: (message: string) => void;
       info: (message: string) => void;
       warn: (message: string) => void;
       error: (message: string) => void;
@@ -43,12 +64,62 @@ declare module "openclaw/plugin-sdk" {
         ) => Promise<{ code: number; stdout?: string; stderr?: string }>;
       };
       channel: {
+        telegram: {
+          sendMessage: (
+            target: string,
+            text: string,
+            options?: TelegramSendOptions,
+          ) => Promise<unknown>;
+        };
+        slack: {
+          sendMessage: (
+            target: string,
+            text: string,
+            options?: SlackSendOptions,
+          ) => Promise<unknown>;
+        };
+        discord: {
+          sendMessage: (
+            target: string,
+            text: string,
+            options?: DiscordSendOptions,
+          ) => Promise<unknown>;
+        };
+        signal: {
+          sendMessage: (
+            target: string,
+            text: string,
+            options?: BasicSendOptions,
+          ) => Promise<unknown>;
+        };
+        imessage: {
+          sendMessage: (
+            target: string,
+            text: string,
+            options?: BasicSendOptions,
+          ) => Promise<unknown>;
+        };
+        line: {
+          sendMessage: (
+            target: string,
+            text: string,
+            options?: BasicSendOptions,
+          ) => Promise<unknown>;
+        };
+        whatsapp: {
+          sendMessage: (
+            target: string,
+            text: string,
+            options?: BasicSendOptions,
+          ) => Promise<unknown>;
+        };
+        [key: string]: unknown;
         reply: {
           dispatchReplyWithBufferedBlockDispatcher: (args: {
             ctx: unknown;
             cfg: OpenClawConfig;
             dispatcherOptions: {
-              deliver: () => Promise<void> | void;
+              deliver: (payload: ReplyPayload, info: { kind: string }) => Promise<void> | void;
               onError: (err: unknown) => void;
             };
           }) => Promise<void>;

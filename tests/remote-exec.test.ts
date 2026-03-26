@@ -8,7 +8,13 @@ import { captureTmux } from "../src/capture.js";
 import { createTmuxWatchManager } from "../src/manager.js";
 import { createTmuxWatchTool } from "../src/tmux-watch-tool.js";
 
-function createApi(stateDir: string, pluginConfig: Record<string, unknown> = {}) {
+function createApi(
+  stateDir: string,
+  pluginConfig: Record<string, unknown> = {},
+  options?: {
+    runCommandWithTimeout?: (argv: string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  },
+) {
   const commands: string[][] = [];
   return {
     commands,
@@ -36,6 +42,9 @@ function createApi(stateDir: string, pluginConfig: Record<string, unknown> = {})
         system: {
           runCommandWithTimeout: async (argv: string[]) => {
             commands.push(argv);
+            if (options?.runCommandWithTimeout) {
+              return options.runCommandWithTimeout(argv);
+            }
             return { code: 0, stdout: "remote output", stderr: "" };
           },
         },
@@ -152,6 +161,46 @@ test("manager capture uses remote ssh when the subscription has a host", async (
   });
 
   assert.equal(result.text, "remote output");
+  assert.equal(commands[0]?.[0], "bash");
+  assert.match(commands[0]?.[2] ?? "", /ssh devbox/);
+});
+
+test("manager capture does not require local tmux when using a remote host profile", async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "tmux-watch-remote-host-only-"));
+  t.after(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+
+  const { api, commands } = createApi(
+    stateDir,
+    {
+      hosts: {
+        devbox: {
+          sshCommand: "ssh devbox",
+          socket: "/tmp/remote.sock",
+        },
+      },
+    },
+    {
+      runCommandWithTimeout: async (argv: string[]) => {
+        if (argv[0] === "tmux" && argv[1] === "-V") {
+          return { code: 1, stdout: "", stderr: "tmux missing locally" };
+        }
+        return { code: 0, stdout: "remote output", stderr: "" };
+      },
+    },
+  );
+  const manager = createTmuxWatchManager(api as never) as never as {
+    capture: (params: Record<string, unknown>) => Promise<{ text?: string }>;
+  };
+
+  const result = await manager.capture({
+    host: "devbox",
+    target: "work:0.1",
+  });
+
+  assert.equal(result.text, "remote output");
+  assert.equal(commands.some((argv) => argv[0] === "tmux" && argv[1] === "-V"), false);
   assert.equal(commands[0]?.[0], "bash");
   assert.match(commands[0]?.[2] ?? "", /ssh devbox/);
 });

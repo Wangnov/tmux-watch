@@ -7,6 +7,7 @@ import { resolveTmuxWatchConfig, type TmuxWatchConfig, type TmuxWatchHostProfile
 import { createTmuxWatchManager } from "./manager.js";
 import { runTmuxCommand } from "./tmux-exec.js";
 import { installTool, removeTool, type ToolId } from "./tool-install.js";
+import { normalizeTmuxSocket } from "./socket.js";
 
 type Logger = {
   info: (message: string) => void;
@@ -79,15 +80,7 @@ function loadResolvedCliTmuxWatchConfig(api: OpenClawPluginApi): TmuxWatchConfig
 }
 
 function extractSocket(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return "";
-  }
-  const comma = trimmed.indexOf(",");
-  if (comma > 0) {
-    return trimmed.slice(0, comma);
-  }
-  return trimmed;
+  return normalizeTmuxSocket(raw) ?? "";
 }
 
 function printSocketHelp(logger: Logger) {
