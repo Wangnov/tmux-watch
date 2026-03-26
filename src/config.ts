@@ -14,6 +14,11 @@ export type NotifyTarget = {
   label?: string;
 };
 
+export type TmuxWatchHostProfile = {
+  sshCommand: string;
+  socket?: string;
+};
+
 export type TmuxWatchConfig = {
   enabled: boolean;
   captureIntervalSeconds: number;
@@ -26,6 +31,7 @@ export type TmuxWatchConfig = {
   maxOutputChars: number;
   sessionKey?: string;
   socket?: string;
+  hosts: Record<string, TmuxWatchHostProfile>;
   notify: {
     mode: NotifyMode;
     targets: NotifyTarget[];
@@ -46,6 +52,7 @@ const DEFAULTS: Omit<TmuxWatchConfig, "captureIntervalSeconds" | "stableCount"> 
   maxOutputChars: 4000,
   sessionKey: undefined,
   socket: undefined,
+  hosts: {},
   notify: {
     mode: "last",
     targets: [],
@@ -107,6 +114,28 @@ function normalizeTargets(raw: unknown): NotifyTarget[] {
   return targets;
 }
 
+function normalizeHosts(raw: unknown): Record<string, TmuxWatchHostProfile> {
+  if (!isRecord(raw)) {
+    return {};
+  }
+  const hosts: Record<string, TmuxWatchHostProfile> = {};
+  for (const [name, value] of Object.entries(raw)) {
+    const normalizedName = readString(name);
+    if (!normalizedName || !isRecord(value)) {
+      continue;
+    }
+    const sshCommand = readString(value.sshCommand);
+    if (!sshCommand) {
+      continue;
+    }
+    hosts[normalizedName] = {
+      sshCommand,
+      socket: readString(value.socket),
+    };
+  }
+  return hosts;
+}
+
 export function resolveTmuxWatchConfig(raw: unknown): TmuxWatchConfig {
   const value = isRecord(raw) ? raw : {};
   const notifyRaw = isRecord(value.notify) ? value.notify : {};
@@ -130,6 +159,7 @@ export function resolveTmuxWatchConfig(raw: unknown): TmuxWatchConfig {
     maxOutputChars,
     sessionKey: readString(value.sessionKey) ?? DEFAULTS.sessionKey,
     socket: readString(value.socket) ?? DEFAULTS.socket,
+    hosts: normalizeHosts(value.hosts),
     notify: {
       mode: normalizeNotifyMode(notifyRaw.mode, DEFAULTS.notify.mode),
       targets: normalizeTargets(notifyRaw.targets),

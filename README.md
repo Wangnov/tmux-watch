@@ -47,6 +47,12 @@ openclaw plugins install ./tmux-watch.tgz
         "enabled": true,
         "config": {
           "socket": "/private/tmp/tmux-501/default",
+          "hosts": {
+            "devbox": {
+              "sshCommand": "ssh devbox",
+              "socket": "/tmp/tmux-remote.sock"
+            }
+          },
           "captureIntervalSeconds": 10,
           "stableCount": 6,
           "cooldownSeconds": 120,
@@ -74,6 +80,7 @@ openclaw plugins install ./tmux-watch.tgz
 - `socket`：tmux socket 路径（必填）。
 - `captureIntervalSeconds`：每次捕获间隔（秒），默认 `10`。
 - `stableCount`：连续多少次捕获内容一致才触发告警，默认 `6`。总时长 = `captureIntervalSeconds × stableCount`（例如 `3 × 5 = 15s`）。
+- `hosts`：远程 tmux host profile 字典。每个 profile 至少包含 `sshCommand`，可选 `socket` 作为远端默认 tmux socket。
 - `pollIntervalMs`：**兼容字段**，捕获间隔（毫秒）。仅在需要与旧配置兼容时使用。
 - `stableSeconds`：**兼容字段**，稳定时长（秒）。会按当前捕获间隔换算成次数。
 - 兼容字段在插件内部会被统一折算为 `captureIntervalSeconds` 和 `stableCount`；新配置推荐直接使用新版字段。
@@ -117,11 +124,27 @@ echo $TMUX
 
 逗号前的路径就是 socket，配置到 `socket` 字段即可。
 
+### 远程 tmux host 初始化
+
+远程 tmux 由人类先登记连接方式，后续由 Agent 在工具调用里指定 `host` 即可：
+
+```bash
+openclaw tmux-watch host add devbox --ssh "ssh devbox" --socket "/tmp/tmux-remote.sock"
+openclaw tmux-watch host test devbox
+openclaw tmux-watch host list
+```
+
+说明：
+
+- `host add` 只登记远程连接方式和可选默认 socket，不会创建 subscription。
+- 后续 Agent 可在工具调用里传 `host: "devbox"`，现有 `add` / `capture` / `watch` 会自动走远端 tmux。
+
 ### 订阅（通过 Agent 工具）
 
 ```json
 {
   "action": "add",
+  "host": "devbox",
   "target": "session:0.0",
   "label": "codex-tui",
   "note": "本会话是AI编程TUI助手，卡住时总结最后输出并通知我",
@@ -134,6 +157,9 @@ echo $TMUX
 
 ```bash
 openclaw tmux-watch send test-dir:0.0 "your text"
+
+# 远端
+openclaw tmux-watch send --host devbox test-dir:0.0 "your text"
 ```
 
 默认行为等同于两步：先 `send-keys -l` 输入文本，再单独 `send-keys C-m` 提交。两步之间默认延迟 `20ms`。
@@ -159,6 +185,9 @@ openclaw tmux-watch capture session:0.0 --format both --base64
 
 # 指定输出路径（不会自动清理）
 openclaw tmux-watch capture session:0.0 --format image --output /tmp/pane.png
+
+# 远端
+openclaw tmux-watch capture --host devbox session:0.0
 ```
 
 说明：
@@ -221,6 +250,12 @@ Edit `~/.openclaw/openclaw.json`:
         "enabled": true,
         "config": {
           "socket": "/private/tmp/tmux-501/default",
+          "hosts": {
+            "devbox": {
+              "sshCommand": "ssh devbox",
+              "socket": "/tmp/tmux-remote.sock"
+            }
+          },
           "captureIntervalSeconds": 10,
           "stableCount": 6,
           "captureLines": 50,
@@ -245,6 +280,7 @@ Edit `~/.openclaw/openclaw.json`:
 - `socket`: tmux socket path (required).
 - `captureIntervalSeconds`: Capture interval in seconds (default `10`).
 - `stableCount`: Number of consecutive identical captures before alert (default `6`). Total duration = `captureIntervalSeconds × stableCount` (for example `3 × 5 = 15s`).
+- `hosts`: Remote tmux host profiles. Each profile must define `sshCommand` and may define a default remote `socket`.
 - `pollIntervalMs`: **Legacy** capture interval in milliseconds. Use only for backward compatibility.
 - `stableSeconds`: **Legacy** stable duration in seconds. Converted into counts using the current interval.
 - Legacy timing fields are normalized internally into `captureIntervalSeconds` and `stableCount`; prefer the canonical fields in new configs.
@@ -288,11 +324,24 @@ Or make it fully non-interactive:
 openclaw tmux-watch setup --socket "/private/tmp/tmux-501/default" --target "work:0.1"
 ```
 
+### Remote host bootstrap
+
+Remote tmux support starts with a human configuring the SSH profile once:
+
+```bash
+openclaw tmux-watch host add devbox --ssh "ssh devbox" --socket "/tmp/tmux-remote.sock"
+openclaw tmux-watch host test devbox
+openclaw tmux-watch host list
+```
+
+This only registers how to reach the remote tmux environment. The Agent can then pass `host: "devbox"` in regular tool calls such as `add` and `capture`.
+
 ### Add a subscription (via agent tool)
 
 ```json
 {
   "action": "add",
+  "host": "devbox",
   "target": "session:0.0",
   "label": "codex-tui",
   "note": "This is an AI coding TUI; summarize the last output and notify me if it stalls.",
@@ -305,6 +354,9 @@ openclaw tmux-watch setup --socket "/private/tmp/tmux-501/default" --target "wor
 
 ```bash
 openclaw tmux-watch send test-dir:0.0 "your text"
+
+# Remote
+openclaw tmux-watch send --host devbox test-dir:0.0 "your text"
 ```
 
 Default behavior is two-step: send text with `send-keys -l`, then send `C-m` (Enter) separately.
@@ -331,6 +383,9 @@ openclaw tmux-watch capture session:0.0 --format both --base64
 
 # Persist image to a path (no TTL cleanup)
 openclaw tmux-watch capture session:0.0 --format image --output /tmp/pane.png
+
+# Remote
+openclaw tmux-watch capture --host devbox session:0.0
 ```
 
 Notes:

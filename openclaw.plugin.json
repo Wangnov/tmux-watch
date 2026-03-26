@@ -15,6 +15,19 @@
       "ignoreWhitespaceOnlyChanges": { "type": "boolean", "default": true },
       "pollIntervalMs": { "type": "number", "default": 10000 },
       "stableSeconds": { "type": "number", "default": 60 },
+      "hosts": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sshCommand": { "type": "string" },
+            "socket": { "type": "string" }
+          },
+          "required": ["sshCommand"]
+        },
+        "default": {}
+      },
       "captureLines": { "type": "number", "default": 50 },
       "stripAnsi": { "type": "boolean", "default": true },
       "maxOutputChars": { "type": "number", "default": 4000 },

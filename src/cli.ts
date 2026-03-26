@@ -2,7 +2,10 @@ import type { Command } from "commander";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { captureTmux } from "./capture.js";
+import { resolveTmuxWatchConfig, type TmuxWatchConfig, type TmuxWatchHostProfile } from "./config.js";
 import { createTmuxWatchManager } from "./manager.js";
+import { runTmuxCommand } from "./tmux-exec.js";
 import { installTool, removeTool, type ToolId } from "./tool-install.js";
 
 type Logger = {
@@ -16,6 +19,11 @@ type PluginsConfig = {
   entries?: Record<string, { enabled?: boolean; config?: Record<string, unknown> }>;
 };
 
+type TmuxWatchPluginEntry = {
+  enabled?: boolean;
+  config?: Record<string, unknown>;
+};
+
 export type TmuxPaneChoice = {
   target: string;
   sessionName: string;
@@ -23,6 +31,52 @@ export type TmuxPaneChoice = {
   paneTitle?: string;
   currentCommand?: string;
 };
+
+function loadTmuxWatchPluginConfigState(api: OpenClawPluginApi): {
+  fullConfig: Record<string, unknown>;
+  plugins: PluginsConfig;
+  entries: Record<string, TmuxWatchPluginEntry>;
+  entry: TmuxWatchPluginEntry;
+  entryConfig: Record<string, unknown>;
+} {
+  const fullConfig = api.runtime.config.loadConfig();
+  const plugins = (fullConfig.plugins ?? {}) as PluginsConfig;
+  const entries = { ...(plugins.entries ?? {}) };
+  const entry = { ...(entries["tmux-watch"] ?? {}) };
+  const entryConfig = { ...(entry.config ?? {}) };
+  return {
+    fullConfig,
+    plugins,
+    entries,
+    entry,
+    entryConfig,
+  };
+}
+
+async function writeTmuxWatchPluginConfigState(params: {
+  api: OpenClawPluginApi;
+  fullConfig: Record<string, unknown>;
+  plugins: PluginsConfig;
+  entries: Record<string, TmuxWatchPluginEntry>;
+  entry: TmuxWatchPluginEntry;
+  entryConfig: Record<string, unknown>;
+}): Promise<void> {
+  const { api, fullConfig, plugins, entries, entry, entryConfig } = params;
+  entry.config = entryConfig;
+  entries["tmux-watch"] = entry;
+  await api.runtime.config.writeConfigFile({
+    ...fullConfig,
+    plugins: {
+      ...plugins,
+      entries,
+    },
+  });
+}
+
+function loadResolvedCliTmuxWatchConfig(api: OpenClawPluginApi): TmuxWatchConfig {
+  const { entryConfig } = loadTmuxWatchPluginConfigState(api);
+  return resolveTmuxWatchConfig(Object.keys(entryConfig).length > 0 ? entryConfig : api.pluginConfig);
+}
 
 function extractSocket(raw: string): string {
   const trimmed = raw.trim();
@@ -186,26 +240,20 @@ export async function setupTmuxWatch(params: {
   note?: string;
 }) {
   const { api, socket, target, label, note } = params;
-  const cfg = api.runtime.config.loadConfig();
-  const plugins = (cfg.plugins ?? {}) as PluginsConfig;
-  const entries = { ...(plugins.entries ?? {}) };
-  const entry = { ...(entries["tmux-watch"] ?? {}) };
-  const entryConfig = { ...(entry.config ?? {}) };
+  const { fullConfig, plugins, entries, entry, entryConfig } = loadTmuxWatchPluginConfigState(api);
 
   entry.enabled = true;
-  entry.config = {
+  const nextEntryConfig = {
     ...entryConfig,
     socket,
   };
-
-  entries["tmux-watch"] = entry;
-
-  await api.runtime.config.writeConfigFile({
-    ...cfg,
-    plugins: {
-      ...plugins,
-      entries,
-    },
+  await writeTmuxWatchPluginConfigState({
+    api,
+    fullConfig,
+    plugins,
+    entries,
+    entry,
+    entryConfig: nextEntryConfig,
   });
 
   const manager = createTmuxWatchManager(api);
@@ -220,6 +268,95 @@ export async function setupTmuxWatch(params: {
     socket,
     subscription,
   };
+}
+
+export async function saveTmuxWatchHostProfile(params: {
+  api: OpenClawPluginApi;
+  name: string;
+  sshCommand: string;
+  socket?: string;
+}): Promise<void> {
+  const name = params.name.trim();
+  const sshCommand = params.sshCommand.trim();
+  const socket = params.socket?.trim() || undefined;
+  if (!name) {
+    throw new Error("Host name required.");
+  }
+  if (!sshCommand) {
+    throw new Error("SSH command required.");
+  }
+
+  const { api } = params;
+  const { fullConfig, plugins, entries, entry, entryConfig } = loadTmuxWatchPluginConfigState(api);
+  const existingHosts = isRecord(entryConfig.hosts) ? { ...entryConfig.hosts } : {};
+  existingHosts[name] = socket ? { sshCommand, socket } : { sshCommand };
+  await writeTmuxWatchPluginConfigState({
+    api,
+    fullConfig,
+    plugins,
+    entries,
+    entry,
+    entryConfig: {
+      ...entryConfig,
+      hosts: existingHosts,
+    },
+  });
+}
+
+export async function removeTmuxWatchHostProfile(params: {
+  api: OpenClawPluginApi;
+  name: string;
+}): Promise<void> {
+  const name = params.name.trim();
+  if (!name) {
+    throw new Error("Host name required.");
+  }
+  const { api } = params;
+  const { fullConfig, plugins, entries, entry, entryConfig } = loadTmuxWatchPluginConfigState(api);
+  const existingHosts = isRecord(entryConfig.hosts) ? { ...entryConfig.hosts } : {};
+  delete existingHosts[name];
+  await writeTmuxWatchPluginConfigState({
+    api,
+    fullConfig,
+    plugins,
+    entries,
+    entry,
+    entryConfig: {
+      ...entryConfig,
+      hosts: existingHosts,
+    },
+  });
+}
+
+export async function testTmuxWatchHostProfile(params: {
+  api: OpenClawPluginApi;
+  name: string;
+}): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  const config = loadResolvedCliTmuxWatchConfig(params.api);
+  const name = params.name.trim();
+  if (!config.hosts[name]) {
+    throw new Error(`Unknown tmux-watch host: ${name}`);
+  }
+  const result = await runTmuxCommand({
+    api: params.api,
+    config,
+    host: name,
+    tmuxArgs: ["-V"],
+    timeoutMs: 5000,
+  });
+  return {
+    ok: result.code === 0,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+  };
+}
+
+function listTmuxWatchHostProfiles(api: OpenClawPluginApi): Record<string, TmuxWatchHostProfile> {
+  return loadResolvedCliTmuxWatchConfig(api).hosts;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 export function registerTmuxWatchCli(params: {
@@ -322,6 +459,73 @@ export function registerTmuxWatchCli(params: {
       printSocketHelp(logger);
     });
 
+  const hostRoot = root.command("host").description("Manage remote tmux SSH host profiles");
+
+  hostRoot
+    .command("add")
+    .description("Add or update a remote host profile")
+    .argument("<name>", "host profile name")
+    .option("--ssh <command>", "SSH command, e.g. ssh devbox")
+    .option("--socket <path>", "default remote tmux socket")
+    .action(async (name: string, options: { ssh?: string; socket?: string }) => {
+      let sshCommand = options.ssh?.trim();
+      if (!sshCommand) {
+        sshCommand = await promptText("SSH command (for example: ssh devbox): ");
+      }
+      if (!sshCommand) {
+        throw new Error("SSH command required. Re-run with --ssh or provide it interactively.");
+      }
+      const socket = options.socket ? extractSocket(options.socket) : await promptText("Default remote socket (optional): ");
+      await saveTmuxWatchHostProfile({
+        api,
+        name,
+        sshCommand,
+        socket: socket ? extractSocket(socket) : undefined,
+      });
+      logger.info(`Saved tmux-watch host profile '${name}'.`);
+    });
+
+  hostRoot
+    .command("list")
+    .description("List configured remote host profiles")
+    .action(() => {
+      const hosts = listTmuxWatchHostProfiles(api);
+      const names = Object.keys(hosts).sort();
+      if (names.length === 0) {
+        logger.info("No tmux-watch host profiles configured.");
+        return;
+      }
+      for (const name of names) {
+        const profile = hosts[name]!;
+        logger.info(
+          `${name}: ssh='${profile.sshCommand}'${profile.socket ? ` socket=${profile.socket}` : ""}`,
+        );
+      }
+    });
+
+  hostRoot
+    .command("test")
+    .description("Test a remote host profile by running tmux -V")
+    .argument("<name>", "host profile name")
+    .action(async (name: string) => {
+      const result = await testTmuxWatchHostProfile({ api, name });
+      if (!result.ok) {
+        logger.error(result.stderr.trim() || result.stdout.trim() || "Remote tmux test failed.");
+        process.exitCode = 1;
+        return;
+      }
+      logger.info(result.stdout.trim() || "Remote tmux host profile OK.");
+    });
+
+  hostRoot
+    .command("remove")
+    .description("Remove a remote host profile")
+    .argument("<name>", "host profile name")
+    .action(async (name: string) => {
+      await removeTmuxWatchHostProfile({ api, name });
+      logger.info(`Removed tmux-watch host profile '${name}'.`);
+    });
+
   root
     .command("send")
     .description("Send text to a tmux target (text then Enter)")
@@ -329,6 +533,7 @@ export function registerTmuxWatchCli(params: {
     .argument("[text...]", "text to send (can be multiple words)")
     .option("--target <target>", "tmux target (overrides positional)")
     .option("--text <text>", "text to send (overrides positional)")
+    .option("--host <name>", "remote host profile name")
     .option("--socket <path>", "tmux socket path (or full $TMUX value)")
     .option("--delay-ms <ms>", "delay between text and Enter (default: 20)", "20")
     .option("--no-enter", "do not send Enter after text")
@@ -339,6 +544,7 @@ export function registerTmuxWatchCli(params: {
         options: {
           target?: string;
           text?: string;
+          host?: string;
           socket?: string;
           delayMs?: string;
           enter?: boolean;
@@ -354,15 +560,21 @@ export function registerTmuxWatchCli(params: {
           return;
         }
 
+        const host = options.host?.trim() || undefined;
         const socket = options.socket
           ? extractSocket(options.socket)
-          : resolveSocketFromEnv();
+          : host
+            ? undefined
+            : resolveSocketFromEnv();
         const delayMs = normalizeDelayMs(options.delayMs, 20);
         const enter = options.enter !== false;
-
-        const argvBase = socket ? ["tmux", "-S", socket] : ["tmux"];
-        const sendText = [...argvBase, "send-keys", "-t", target, "-l", "--", text];
-        const res = await api.runtime.system.runCommandWithTimeout(sendText, {
+        const config = loadResolvedCliTmuxWatchConfig(api);
+        const res = await runTmuxCommand({
+          api,
+          config,
+          host,
+          socket,
+          tmuxArgs: ["send-keys", "-t", target, "-l", "--", text],
           timeoutMs: 5000,
         });
         if (res.code !== 0) {
@@ -376,8 +588,12 @@ export function registerTmuxWatchCli(params: {
           if (delayMs > 0) {
             await new Promise((resolve) => setTimeout(resolve, delayMs));
           }
-          const sendEnter = [...argvBase, "send-keys", "-t", target, "C-m"];
-          const resEnter = await api.runtime.system.runCommandWithTimeout(sendEnter, {
+          const resEnter = await runTmuxCommand({
+            api,
+            config,
+            host,
+            socket,
+            tmuxArgs: ["send-keys", "-t", target, "C-m"],
             timeoutMs: 2000,
           });
           if (resEnter.code !== 0) {
@@ -397,6 +613,7 @@ export function registerTmuxWatchCli(params: {
     .description("Capture tmux output as text/image")
     .argument("[target]", "tmux target (session:window.pane or %pane_id)")
     .option("--target <target>", "tmux target (overrides positional)")
+    .option("--host <name>", "remote host profile name")
     .option("--socket <path>", "tmux socket path (or full $TMUX value)")
     .option("--lines <n>", "lines to capture (default: config)")
     .option("--strip-ansi", "strip ANSI for text output")
@@ -412,6 +629,7 @@ export function registerTmuxWatchCli(params: {
         targetArg: string | undefined,
         options: {
           target?: string;
+          host?: string;
           socket?: string;
           lines?: string;
           stripAnsi?: boolean;
@@ -439,8 +657,10 @@ export function registerTmuxWatchCli(params: {
         }
 
         try {
-          const manager = createTmuxWatchManager(api);
-          const result = await manager.capture({
+          const result = await captureTmux({
+            api,
+            config: loadResolvedCliTmuxWatchConfig(api),
+            host: options.host?.trim() || undefined,
             target,
             socket: options.socket ? extractSocket(options.socket) : undefined,
             captureLines: normalizeNumber(options.lines),

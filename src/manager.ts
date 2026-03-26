@@ -5,6 +5,7 @@ import path from "node:path";
 import { captureTmux, type CaptureParams, type CaptureResult } from "./capture.js";
 import { normalizeTimingOverride, toIntervalMs } from "./compat.js";
 import { stripAnsi, truncateOutput } from "./text-utils.js";
+import { runTmuxCommand } from "./tmux-exec.js";
 import {
   resolveTmuxWatchConfig,
   type NotifyMode,
@@ -17,6 +18,7 @@ export type TmuxWatchSubscription = {
   label?: string;
   note?: string;
   target: string;
+  host?: string;
   socket?: string;
   sessionKey?: string;
   captureIntervalSeconds?: number;
@@ -98,8 +100,6 @@ export class TmuxWatchManager {
   private stateDir: string | null = null;
   private loaded = false;
   private active = false;
-  private tmuxChecked = false;
-  private tmuxAvailable = false;
 
   constructor(api: OpenClawPluginApi) {
     this.api = api;
@@ -114,10 +114,6 @@ export class TmuxWatchManager {
     this.stateDir = ctx.stateDir ?? null;
     this.active = true;
     await this.ensureLoaded();
-    await this.ensureTmuxAvailable();
-    if (!this.tmuxAvailable) {
-      return;
-    }
     for (const entry of this.entries.values()) {
       this.startWatch(entry);
     }
@@ -160,10 +156,6 @@ export class TmuxWatchManager {
   }
 
   async capture(params: CaptureParams): Promise<CaptureResult> {
-    await this.ensureTmuxAvailable();
-    if (!this.tmuxAvailable) {
-      throw new Error("tmux not available");
-    }
     return captureTmux({ api: this.api, config: this.config, ...params });
   }
 
@@ -179,7 +171,7 @@ export class TmuxWatchManager {
     const runtime = existing?.runtime ?? createRuntime();
     this.entries.set(id, { subscription, runtime });
     await this.saveState();
-    if (this.active && this.tmuxAvailable && subscription.enabled !== false) {
+    if (this.active && subscription.enabled !== false) {
       this.startWatch(this.entries.get(id)!);
     } else if (existing?.runtime.timer) {
       clearInterval(existing.runtime.timer);
@@ -290,6 +282,7 @@ export class TmuxWatchManager {
         entry.runtime.lastError = err instanceof Error ? err.message : String(err);
       });
     }, intervalMs);
+    entry.runtime.timer.unref?.();
   }
 
   private async pollWatch(entry: WatchEntry): Promise<void> {
@@ -334,25 +327,24 @@ export class TmuxWatchManager {
   }
 
   private async captureOutput(subscription: TmuxWatchSubscription): Promise<string | null> {
-    if (!this.tmuxAvailable) {
-      return null;
-    }
     const target = subscription.target.trim();
     if (!target) {
       return null;
     }
 
     const captureLines = resolveCaptureLines(subscription, this.config);
-    const socket = subscription.socket ?? this.config.socket;
-    const argv = socket
-      ? ["tmux", "-S", socket, "capture-pane", "-p", "-J", "-t", target]
-      : ["tmux", "capture-pane", "-p", "-J", "-t", target];
+    const tmuxArgs = ["capture-pane", "-p", "-J", "-t", target];
     if (captureLines > 0) {
-      argv.push("-S", `-${captureLines}`);
+      tmuxArgs.push("-S", `-${captureLines}`);
     }
 
     try {
-      const result = await this.api.runtime.system.runCommandWithTimeout(argv, {
+      const result = await runTmuxCommand({
+        api: this.api,
+        config: this.config,
+        host: subscription.host,
+        socket: subscription.socket,
+        tmuxArgs,
         timeoutMs: Math.max(1000, resolveIntervalMs(subscription, this.config) - 50),
       });
       if (result.code !== 0) {
@@ -399,6 +391,7 @@ export class TmuxWatchManager {
       id: subscription.id,
       label: subscription.label,
       note: subscription.note,
+      host: subscription.host,
       target: subscription.target,
       sessionKey,
       notifyMode: resolveNotifyMode(subscription, this.config),
@@ -430,6 +423,7 @@ export class TmuxWatchManager {
       "policy: notify user (do not reply NO_REPLY unless user explicitly requested silence)",
       `subscription: ${subscription.label ? `${subscription.label} (${subscription.id})` : subscription.id}`,
       subscription.note ? `subscription_note: ${subscription.note}` : null,
+      subscription.host ? `host: ${subscription.host}` : null,
       `tmux target: ${subscription.target}`,
       `session: ${sessionKey}`,
       `notify.mode: ${details.notifyMode}`,
@@ -538,27 +532,6 @@ export class TmuxWatchManager {
       const message = err instanceof Error ? err.message : String(err);
       this.api.logger.warn(`[tmux-watch] session store read failed: ${message}`);
       return null;
-    }
-  }
-
-  private async ensureTmuxAvailable(): Promise<void> {
-    if (this.tmuxChecked) {
-      return;
-    }
-    this.tmuxChecked = true;
-    try {
-      const res = await this.api.runtime.system.runCommandWithTimeout(["tmux", "-V"], {
-        timeoutMs: 2000,
-      });
-      this.tmuxAvailable = res.code === 0;
-      if (!this.tmuxAvailable) {
-        this.api.logger.warn("[tmux-watch] tmux not available (tmux -V failed)");
-      }
-    } catch (err) {
-      this.tmuxAvailable = false;
-      this.api.logger.warn(
-        `[tmux-watch] tmux not available: ${err instanceof Error ? err.message : String(err)}`,
-      );
     }
   }
 }
@@ -746,6 +719,7 @@ function sanitizeSubscriptionInput(
     label: typeof input.label === "string" ? input.label.trim() : undefined,
     note: typeof input.note === "string" ? input.note.trim() : undefined,
     target: input.target.trim(),
+    host: typeof input.host === "string" ? input.host.trim() : undefined,
     socket: typeof input.socket === "string" ? input.socket.trim() : undefined,
     sessionKey: typeof input.sessionKey === "string" ? input.sessionKey.trim() : undefined,
     captureIntervalSeconds: timing.captureIntervalSeconds,
@@ -782,6 +756,7 @@ function normalizeStoredSubscription(
     label: typeof input.label === "string" ? input.label.trim() : undefined,
     note: typeof input.note === "string" ? input.note.trim() : undefined,
     target: input.target.trim(),
+    host: typeof input.host === "string" ? input.host.trim() : undefined,
     socket: typeof input.socket === "string" ? input.socket.trim() : undefined,
     sessionKey: typeof input.sessionKey === "string" ? input.sessionKey.trim() : undefined,
     captureIntervalSeconds: timing.captureIntervalSeconds,

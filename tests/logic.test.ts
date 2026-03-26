@@ -30,6 +30,7 @@ function makeConfig(overrides: PartialConfig = {}): TmuxWatchConfig {
     maxOutputChars: 4000,
     sessionKey: undefined,
     socket: undefined,
+    hosts: {},
     notify: {
       mode: "targets",
       targets: [],

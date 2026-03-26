@@ -8,6 +8,7 @@ type ToolParams = {
   action: (typeof ACTIONS)[number];
   id?: string;
   target?: string;
+  host?: string;
   label?: string;
   note?: string;
   sessionKey?: string;
@@ -91,6 +92,7 @@ export function createTmuxWatchTool(manager: TmuxWatchManager) {
         },
         id: { type: "string", description: "Subscription id." },
         target: { type: "string", description: "tmux target, e.g. session:0.0" },
+        host: { type: "string", description: "Remote host profile name for SSH tmux." },
         label: { type: "string", description: "Human-friendly label." },
         note: { type: "string", description: "Purpose/intent note shown to the agent on alert." },
         sessionKey: { type: "string", description: "Session key override." },
@@ -166,6 +168,7 @@ export function createTmuxWatchTool(manager: TmuxWatchManager) {
             const subscription: Partial<TmuxWatchSubscription> & { target: string } = {
               id: readString(params.id),
               target,
+              host: readString(params.host),
               label: readString(params.label),
               note: readString(params.note),
               sessionKey: readString(params.sessionKey),
@@ -224,6 +227,7 @@ export function createTmuxWatchTool(manager: TmuxWatchManager) {
             }
             const result = await manager.capture({
               target,
+              host: readString(params.host),
               socket: readString(params.socket),
               captureLines:
                 typeof params.captureLines === "number" ? params.captureLines : undefined,

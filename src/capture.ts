@@ -6,12 +6,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { stripAnsi, truncateOutput } from "./text-utils.js";
+import { runTmuxCommand, shellQuote } from "./tmux-exec.js";
 import { resolveBinaryName, resolveToolsDir, type ToolId } from "./tool-install.js";
 
 export type CaptureFormat = "text" | "image" | "both";
 export type ImageFormat = "png" | "svg" | "webp";
 
 export type CaptureParams = {
+  host?: string;
   target: string;
   socket?: string;
   captureLines?: number;
@@ -87,7 +89,6 @@ export async function captureTmux(params: {
   if (!target) {
     throw new Error("target required for capture");
   }
-  const socket = normalizeSocket(params.socket ?? params.config.socket);
   const format = resolveCaptureFormat(params.format, params.outputPath);
   const captureLines = resolveCaptureLines(params.captureLines, params.config);
   const stripOutput = resolveStripAnsi(params.stripAnsi, params.config);
@@ -95,8 +96,10 @@ export async function captureTmux(params: {
 
   const rawOutput = await capturePaneOutput({
     api: params.api,
+    config: params.config,
+    host: params.host,
     target,
-    socket,
+    socket: params.socket,
     captureLines,
     includeAnsi,
   });
@@ -150,6 +153,8 @@ export async function captureTmux(params: {
 
 type CapturePaneParams = {
   api: OpenClawPluginApi;
+  config: TmuxWatchConfig;
+  host?: string;
   target: string;
   socket?: string;
   captureLines: number;
@@ -157,18 +162,21 @@ type CapturePaneParams = {
 };
 
 async function capturePaneOutput(params: CapturePaneParams): Promise<string> {
-  const argv = params.socket
-    ? ["tmux", "-S", params.socket, "capture-pane", "-p", "-J", "-t", params.target]
-    : ["tmux", "capture-pane", "-p", "-J", "-t", params.target];
+  const tmuxArgs = ["capture-pane", "-p", "-J", "-t", params.target];
   if (params.includeAnsi) {
-    argv.push("-e");
+    tmuxArgs.push("-e");
   }
   if (params.captureLines > 0) {
-    argv.push("-S", `-${params.captureLines}`);
+    tmuxArgs.push("-S", `-${params.captureLines}`);
   }
 
   try {
-    const result = await params.api.runtime.system.runCommandWithTimeout(argv, {
+    const result = await runTmuxCommand({
+      api: params.api,
+      config: params.config,
+      host: params.host,
+      socket: params.socket,
+      tmuxArgs,
       timeoutMs: 5000,
     });
     if (result.code !== 0) {
@@ -363,21 +371,6 @@ function resolveTtlSeconds(raw: unknown): number {
   return DEFAULT_TTL_SECONDS;
 }
 
-function normalizeSocket(raw: string | undefined): string | undefined {
-  if (!raw) {
-    return undefined;
-  }
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  const comma = trimmed.indexOf(",");
-  if (comma > 0) {
-    return trimmed.slice(0, comma);
-  }
-  return trimmed;
-}
-
 async function ensureTempDir(): Promise<string> {
   const dir = path.join(os.tmpdir(), TEMP_DIR_NAME);
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -438,8 +431,4 @@ function scheduleCleanup(filePath: string, ttlMs: number): void {
     void fs.rm(filePath, { force: true });
   }, ttlMs);
   timer.unref?.();
-}
-
-function shellQuote(input: string): string {
-  return `'${input.replace(/'/g, `'"'"'`)}'`;
 }
