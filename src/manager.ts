@@ -320,7 +320,10 @@ export class TmuxWatchManager {
       const raw = await fs.readFile(filePath, "utf8");
       const parsed = JSON.parse(raw) as PersistedState;
       if (!parsed || parsed.version !== STATE_VERSION || !Array.isArray(parsed.subscriptions)) {
-        return { version: STATE_VERSION, subscriptions: [] };
+        this.debugLog("state sync skipped because persisted state shape is invalid", {
+          statePath: filePath,
+        });
+        return null;
       }
       return parsed;
     } catch (err) {
@@ -592,6 +595,7 @@ export class TmuxWatchManager {
           };
           const canSend = () =>
             !isStale() &&
+            this.isManagedEntry(entry) &&
             entry.runtime.notifyInFlight?.hash === hash &&
             entry.runtime.notifyInFlight?.token === notifyToken;
           let notified = false;

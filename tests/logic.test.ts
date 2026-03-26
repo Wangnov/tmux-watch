@@ -70,6 +70,16 @@ async function waitFor(
   assert.fail(`condition not met within ${timeoutMs}ms`);
 }
 
+type ManagerTestHarness = {
+  syncStateFromDiskIfNeeded(): Promise<void>;
+  pollWatch(entry: unknown): Promise<void>;
+  entries: Map<string, unknown>;
+};
+
+function managerHarness(manager: unknown): ManagerTestHarness {
+  return manager as ManagerTestHarness;
+}
+
 test("resolveIntervalMs prefers captureIntervalSeconds over pollIntervalMs", () => {
   const cfg = makeConfig({ captureIntervalSeconds: 2, pollIntervalMs: 9000 });
   assert.equal(resolveIntervalMs(makeSub(), cfg), 2000);
@@ -179,6 +189,197 @@ test("manager syncs new state even when no watch timers are active", async () =>
     assert.equal(after.length, 1);
     assert.equal(after[0]?.id, "sub-from-disk");
   } finally {
+    await manager.stop();
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("manager ignores malformed persisted state and keeps live subscriptions", async () => {
+  const stateDir = await fs.mkdtemp(
+    path.join(os.tmpdir(), "tmux-watch-invalid-state-"),
+  );
+  const api = {
+    pluginConfig: {
+      enabled: true,
+      debug: false,
+      captureIntervalSeconds: 60,
+      stableCount: 6,
+      notify: { mode: "targets", targets: [] },
+    },
+    config: {
+      session: { scope: "agent", mainKey: "main" },
+      agents: { list: [{ id: "main", default: true }] },
+    },
+    logger: {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+    },
+    runtime: {
+      state: {
+        resolveStateDir: () => stateDir,
+      },
+      system: {
+        runCommandWithTimeout: async (argv: string[]) => {
+          if (argv[0] === "tmux" && argv[1] === "-V") {
+            return { code: 0, stdout: "tmux 3.4", stderr: "" };
+          }
+          return { code: 1, stdout: "", stderr: "not implemented in test" };
+        },
+      },
+    },
+  } as unknown as OpenClawPluginApi;
+  const manager = createTmuxWatchManager(api);
+
+  try {
+    await manager.addSubscription({
+      id: "sub-live",
+      target: "session:0.0",
+      enabled: false,
+      captureIntervalSeconds: 60,
+    });
+    const before = await manager.listSubscriptions({ includeOutput: false });
+    assert.equal(before.length, 1);
+    assert.equal(before[0]?.id, "sub-live");
+
+    const statePath = path.join(stateDir, "tmux-watch", "subscriptions.json");
+    await fs.mkdir(path.dirname(statePath), { recursive: true });
+    await fs.writeFile(
+      statePath,
+      JSON.stringify(
+        {
+          version: 1,
+          subscriptions: {
+            id: "not-an-array",
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await managerHarness(manager).syncStateFromDiskIfNeeded();
+
+    const after = await manager.listSubscriptions({ includeOutput: false });
+    assert.equal(after.length, 1);
+    assert.equal(after[0]?.id, "sub-live");
+  } finally {
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("manager does not send after a subscription is removed during notify dispatch", async () => {
+  const stateDir = await fs.mkdtemp(
+    path.join(os.tmpdir(), "tmux-watch-stale-notify-"),
+  );
+  const telegramCalls: Array<{ target: string; text: string }> = [];
+  let dispatchStarted = false;
+  let releaseDispatch!: () => void;
+  const releaseDispatchPromise = new Promise<void>((resolve) => {
+    releaseDispatch = resolve;
+  });
+  const api = {
+    pluginConfig: {
+      enabled: true,
+      debug: false,
+      captureIntervalSeconds: 9999,
+      stableCount: 1,
+      sessionKey: "main",
+      notify: {
+        mode: "targets",
+        targets: [
+          {
+            channel: "telegram",
+            target: "chat-1",
+          },
+        ],
+      },
+    },
+    config: {
+      session: { scope: "agent", mainKey: "main" },
+      agents: { list: [{ id: "main", default: true }] },
+    },
+    logger: {
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+    },
+    runtime: {
+      state: {
+        resolveStateDir: () => stateDir,
+      },
+      system: {
+        runCommandWithTimeout: async (argv: string[]) => {
+          if (argv[0] === "tmux" && argv[1] === "-V") {
+            return { code: 0, stdout: "tmux 3.4", stderr: "" };
+          }
+          return { code: 0, stdout: "pane output\n", stderr: "" };
+        },
+      },
+      channel: {
+        reply: {
+          dispatchReplyWithBufferedBlockDispatcher: async ({
+            dispatcherOptions,
+          }: {
+            dispatcherOptions: {
+              deliver: (payload: unknown, info: { kind: string }) => Promise<void> | void;
+            };
+          }) => {
+            dispatchStarted = true;
+            await releaseDispatchPromise;
+            await dispatcherOptions.deliver(
+              { text: "notified output" },
+              { kind: "final" },
+            );
+          },
+        },
+        telegram: {
+          sendMessage: async (target: string, text: string) => {
+            telegramCalls.push({ target, text });
+          },
+        },
+      },
+    },
+  } as unknown as OpenClawPluginApi;
+  const manager = createTmuxWatchManager(api);
+
+  try {
+    await manager.start({ stateDir } as unknown as OpenClawPluginServiceContext);
+    await manager.addSubscription({
+      id: "sub-remote",
+      target: "session:0.0",
+      enabled: true,
+      captureIntervalSeconds: 9999,
+      stableCount: 1,
+      notify: {
+        mode: "targets",
+        targets: [
+          {
+            channel: "telegram",
+            target: "chat-1",
+          },
+        ],
+      },
+    });
+
+    const entry = managerHarness(manager).entries.get("sub-remote");
+    assert.ok(entry);
+
+    await managerHarness(manager).pollWatch(entry);
+    const secondPoll = managerHarness(manager).pollWatch(entry);
+
+    await waitFor(async () => dispatchStarted);
+    assert.equal(telegramCalls.length, 0);
+
+    await manager.removeSubscription("sub-remote");
+    releaseDispatch();
+
+    await secondPoll;
+    assert.equal(telegramCalls.length, 0);
+  } finally {
+    releaseDispatch?.();
     await manager.stop();
     await fs.rm(stateDir, { recursive: true, force: true });
   }
