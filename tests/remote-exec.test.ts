@@ -7,6 +7,7 @@ import { resolveTmuxWatchConfig } from "../src/config.js";
 import { captureTmux } from "../src/capture.js";
 import { createTmuxWatchManager } from "../src/manager.js";
 import { createTmuxWatchTool } from "../src/tmux-watch-tool.js";
+import { buildRemoteTmuxShellCommand } from "../src/tmux-exec.js";
 
 function createApi(
   stateDir: string,
@@ -203,4 +204,19 @@ test("manager capture does not require local tmux when using a remote host profi
   assert.equal(commands.some((argv) => argv[0] === "tmux" && argv[1] === "-V"), false);
   assert.equal(commands[0]?.[0], "bash");
   assert.match(commands[0]?.[2] ?? "", /ssh devbox/);
+});
+
+test("buildRemoteTmuxShellCommand preserves spaced tmux arguments over ssh", () => {
+  const cmd = buildRemoteTmuxShellCommand("ssh devbox", undefined, [
+    "send-keys",
+    "-t",
+    "work:0.1",
+    "-l",
+    "--",
+    "echo remote smoke tick-4",
+  ]);
+
+  assert.match(cmd, /^ssh devbox -- /);
+  assert.match(cmd, /'echo remote smoke tick-4'/);
+  assert.doesNotMatch(cmd, /ssh devbox 'tmux'/);
 });

@@ -561,6 +561,7 @@ export function registerTmuxWatchCli(params: {
             : resolveSocketFromEnv();
         const delayMs = normalizeDelayMs(options.delayMs, 20);
         const enter = options.enter !== false;
+        const enterTimeoutMs = host ? 5000 : 2000;
         const config = loadResolvedCliTmuxWatchConfig(api);
         const res = await runTmuxCommand({
           api,
@@ -587,7 +588,7 @@ export function registerTmuxWatchCli(params: {
             host,
             socket,
             tmuxArgs: ["send-keys", "-t", target, "C-m"],
-            timeoutMs: 2000,
+            timeoutMs: enterTimeoutMs,
           });
           if (resEnter.code !== 0) {
             const err = (resEnter.stderr ?? resEnter.stdout ?? "").trim();

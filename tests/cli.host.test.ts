@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Command } from "commander";
 import {
+  registerTmuxWatchCli,
   saveTmuxWatchHostProfile,
   removeTmuxWatchHostProfile,
   testTmuxWatchHostProfile,
@@ -8,9 +10,13 @@ import {
 
 function createApi() {
   let writtenConfig: Record<string, unknown> | null = null;
-  const commands: string[][] = [];
+  const commands: Array<{ argv: string[]; timeoutMs?: number }> = [];
+  const infos: string[] = [];
+  const errors: string[] = [];
   return {
     commands,
+    infos,
+    errors,
     api: {
       pluginConfig: { enabled: true },
       config: {
@@ -18,17 +24,24 @@ function createApi() {
         agents: { list: [{ id: "main", default: true }] },
       },
       logger: {
-        info: () => {},
+        info: (message: string) => {
+          infos.push(message);
+        },
         warn: () => {},
-        error: () => {},
+        error: (message: string) => {
+          errors.push(message);
+        },
       },
       runtime: {
         state: {
           resolveStateDir: () => "/tmp/tmux-watch-cli-host",
         },
         system: {
-          runCommandWithTimeout: async (argv: string[]) => {
-            commands.push(argv);
+          runCommandWithTimeout: async (
+            argv: string[],
+            options?: { timeoutMs?: number },
+          ) => {
+            commands.push({ argv, timeoutMs: options?.timeoutMs });
             return { code: 0, stdout: "tmux 3.4", stderr: "" };
           },
         },
@@ -120,9 +133,64 @@ test("testTmuxWatchHostProfile runs tmux -V over the configured ssh command", as
 
   assert.equal(result.ok, true);
   assert.equal(commands.length, 1);
-  assert.equal(commands[0]?.[0], "bash");
-  assert.equal(commands[0]?.[1], "-lc");
-  assert.match(commands[0]?.[2] ?? "", /ssh oldbox/);
-  assert.match(commands[0]?.[2] ?? "", /tmux/);
-  assert.match(commands[0]?.[2] ?? "", /-V/);
+  assert.equal(commands[0]?.argv[0], "bash");
+  assert.equal(commands[0]?.argv[1], "-lc");
+  assert.match(commands[0]?.argv[2] ?? "", /ssh oldbox/);
+  assert.match(commands[0]?.argv[2] ?? "", /tmux/);
+  assert.match(commands[0]?.argv[2] ?? "", /-V/);
+});
+
+test("remote tmux-watch send gives the Enter step enough timeout budget", async () => {
+  const { api, commands, errors } = createApi();
+  api.runtime.config.loadConfig = (() => ({
+    plugins: {
+      entries: {
+        "tmux-watch": {
+          enabled: true,
+          config: {
+            hosts: {
+              "oracle-sjc": {
+                sshCommand: "ssh oracle-sjc",
+              },
+            },
+          },
+        },
+      },
+    },
+  })) as never;
+  api.runtime.system.runCommandWithTimeout = async (
+    argv: string[],
+    options?: { timeoutMs?: number },
+  ) => {
+    commands.push({ argv, timeoutMs: options?.timeoutMs });
+    const command = argv[2] ?? "";
+    if (command.includes("'C-m'") || command.includes("C-m")) {
+      if ((options?.timeoutMs ?? 0) < 3000) {
+        return { code: 124, stdout: "", stderr: "Timed out after 2000ms" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+
+  const program = new Command();
+  registerTmuxWatchCli({
+    program,
+    api: api as never,
+    logger: api.logger,
+  });
+
+  const previousExitCode = process.exitCode;
+  process.exitCode = 0;
+  await program.parseAsync(
+    ["tmux-watch", "send", "--host", "oracle-sjc", "work:0.1", "echo", "remote", "smoke"],
+    { from: "user" },
+  );
+
+  assert.equal(process.exitCode, 0);
+  assert.equal(errors.length, 0);
+  assert.equal(commands.length, 2);
+  assert.equal(commands[1]?.timeoutMs && commands[1].timeoutMs >= 3000, true);
+
+  process.exitCode = previousExitCode;
 });

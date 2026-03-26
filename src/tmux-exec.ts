@@ -57,8 +57,8 @@ export function buildRemoteTmuxShellCommand(
   socket: string | undefined,
   tmuxArgs: string[],
 ): string {
-  const tmuxCommand = buildLocalTmuxArgv(socket, tmuxArgs).map(shellQuote).join(" ");
-  return `${sshCommand} ${tmuxCommand}`;
+  const remoteCommand = buildLocalTmuxArgv(socket, tmuxArgs).map(shellQuote).join(" ");
+  return `${sshCommand} -- ${shellQuote(remoteCommand)}`;
 }
 
 export async function runTmuxCommand(params: RunTmuxCommandParams) {
